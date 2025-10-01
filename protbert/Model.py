@@ -68,8 +68,8 @@ class ProteinMutationDataset(Dataset):
         return {
             'input_ids': encoding['input_ids'].flatten(),
             'attention_mask': encoding['attention_mask'].flatten(),
-            'fitness': torch.tensor(row['normalized_fitness'], dtype=torch.float),
-            'fitness_sigma': torch.tensor(row['normalized_fitness_sigma'], dtype=torch.float)
+            'fitness': torch.tensor(row['normalized_fitness_sigmoid'], dtype=torch.float),
+            'fitness_sigma': torch.tensor(row['normalized_fitness_sigmoid'], dtype=torch.float) # just placeholder for now
         }
 
 

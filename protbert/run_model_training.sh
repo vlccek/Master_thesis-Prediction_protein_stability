@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -q default@pbs-m1.metacentrum.cz
-#PBS -l walltime=1:00:00
-#PBS -l select=1:ncpus=4:ngpus=1:mem=44gb:gpu_mem=44gb:scratch_ssd=40gb
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=4:ngpus=1:mem=44gb:gpu_mem=60gb:scratch_ssd=40gb
 #PBS -N protbert_train
 
 
@@ -29,7 +29,7 @@ mamba activate env/
 
 cd ${SCRATCHDIR}
 
-python train_single.py --epochs 10 --step_validation 1500 --smart_batch 1 --limit 10000
+python train_single.py --epochs 10 --step_validation 9000 --smart_batch 1
 
 
 echo "Training finished, copying the model back to home directory"
