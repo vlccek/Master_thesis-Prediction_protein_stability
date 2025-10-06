@@ -29,7 +29,7 @@ mamba activate env/
 
 cd ${SCRATCHDIR}
 
-python train_single.py --epochs 5 --step_validation 10 --smart_batch 1 --limit 1000
+python train_single.py --epochs 5 --step_validation 2 --smart_batch 1 --limit 1000
 
 
 echo "Training finished, copying the model back to home directory"

@@ -10,7 +10,9 @@ from tqdm import tqdm
 import datetime  # For timestamping logs
 from scipy.stats import pearsonr, spearmanr  # Import pearsonr for accuracy metric
 import os
+import panel as pn
 
+import io
 import multiprocessing
 from functools import partial
 from queue import Empty
@@ -302,9 +304,7 @@ def run_validation_step(model, validation_df, tokenizer, config, global_step):
     # Spojení všech dílčích DataFrame do jednoho výsledného
     results_df = pd.concat(results_dfs, ignore_index=True)
 
-    results_df['error'] = results_df["predicted_fitness"] - results_df["predicted_fitness"]
-
-    log_dataframe_to_wandb_with_colored_error(results_df, table_name=f"validation_results")
+    log_interactive_dataframe_to_wandb(results_df, table_name=f"validation_results")
 
     duration = datetime.datetime.now() - start_time
     calculate_and_log_metrics(val_preds, val_targets, total_val_loss, duration, "validation_step",
@@ -349,8 +349,6 @@ def train_single_model(train_df, testing_df, config):
                          desc=f"Epoch {epoch + 1}/{config.epochs} [Train]", leave=True)
         for step, batch in train_bar:
 
-
-
             optimizer.zero_grad()
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -366,10 +364,9 @@ def train_single_model(train_df, testing_df, config):
 
             global_step += 1
 
-            if global_step > 0 and global_step % config.run_validation_step == 0:
+            if global_step > 0 and global_step % config.step_validation == 0:
                 testing_subset_df = testing_df.sample(frac=0.1)
                 run_validation_step(model, testing_subset_df, tokenizer, config, global_step)
-
 
             total_train_loss += loss.item()
             train_preds.extend(predictions.detach().cpu().numpy())
@@ -444,7 +441,7 @@ def train_single_model(train_df, testing_df, config):
 
         results_df['error'] = results_df["predicted_fitness"] - results_df["predicted_fitness"]
 
-        log_dataframe_to_wandb_with_colored_error(results_df, table_name=f"epoch_val")
+        log_interactive_dataframe_to_wandb(results_df, table_name=f"epoch_val")
 
         val_duration = datetime.datetime.now() - val_start_time
         avg_val_loss = calculate_and_log_metrics(val_preds, val_targets, total_val_loss, val_duration, "epoch_val",
@@ -542,21 +539,25 @@ def run_validation_worker(config, model, df):
     print(f"--- [Async Val] Process finished. Results sent back. ---")
 
 
-def log_dataframe_to_wandb_with_colored_error(
+def log_interactive_dataframe_to_wandb(
         df: pd.DataFrame,
-        table_name: str = "validation_results",
+        table_name: str = "validation_results_interactive",
 ):
+    df['error'] = df["predicted_fitness"] - df["actual_fitness"]
 
-    html_table_string = (
-        df.style
-        .background_gradient(cmap='coolwarm', subset=['error'])
-        .format('{:+.4f}', subset=['error'])
-        .to_html(index=False)
+
+    interactive_table = pn.widgets.Tabulator(
+        df,
+        header_filters=True,
+        layout='fit_columns'  # Zajistí, že se sloupce vejdou do šířky
     )
 
-    # 4. Zalogujeme do wandb jako HTML objekt
+
+
+    html_buffer = io.StringIO()
+    interactive_table.save(html_buffer, embed=True)
+    html_table_string = html_buffer.getvalue()
+
     wandb.log({
         table_name: wandb.Html(html_table_string)
     })
-
-    print(f"Tabulka '{table_name}' byla úspěšně zalogována do wandb.")

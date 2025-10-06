@@ -30,7 +30,7 @@ df_test = pd.read_csv("dataset_255w_test.csv")
 
 if args.limit > 0:
     df = df[:args.limit]
-    df_test = df_test[:int(args.limit*0.1)]
+    df_test = df_test[:int(max(2, args.limit*0.1))]
 
 gpu_memory = 0
 
@@ -38,17 +38,20 @@ if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
         gpu_memory = props.total_memory / 1024 ** 3
+
+    if gpu_memory < 41:
+        args.batch_size = 25
+    elif gpu_memory < 47:
+        args.batch_size = 30
+    elif gpu_memory < 86:
+        args.batch_size = 84
+    else:
+        args.batch_size = 90
 else:
     print("CUDA není dostupná")
+    args.batch_size = 2
 
-if gpu_memory < 41:
-    args.batch_size = 25
-elif gpu_memory< 47:
-    args.batch_size = 30
-elif gpu_memory < 86:
-    args.batch_size = 84
-else:
-    args.batch_size = 90
+
 
 
 
