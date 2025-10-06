@@ -68,8 +68,8 @@ class ProteinMutationDataset(Dataset):
         return {
             'input_ids': encoding['input_ids'].flatten(),
             'attention_mask': encoding['attention_mask'].flatten(),
-            'fitness': torch.tensor(row['normalized_fitness_sigmoid'], dtype=torch.float),
-            'fitness_sigma': torch.tensor(row['normalized_fitness_sigmoid'], dtype=torch.float) # just placeholder for now
+            'fitness': torch.tensor(row['target'], dtype=torch.float),
+            'fitness_sigma': torch.tensor(row['target'], dtype=torch.float)  # just placeholder for now
         }
 
 
@@ -252,22 +252,24 @@ def calculate_and_log_metrics(val_preds, val_targets, total_val_loss, duration, 
 
 
 def run_validation_step(model, validation_df, tokenizer, config, global_step):
-    """
-    Runs validation on a subset of the data and logs comprehensive metrics to wandb.
-    """
     start_time = datetime.datetime.now()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
 
     val_dataset = ProteinMutationDataset(validation_df, tokenizer, config.max_length)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+    # Je důležité nastavit shuffle=False, aby se zachovalo pořadí dat pro správné spojení výsledků
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
 
     total_val_loss = 0
     val_preds = []
     val_targets = []
 
+    # Seznam pro ukládání dílčích DataFrame pro každou dávku
+    results_dfs = []
+    processed_samples = 0
+
     with torch.no_grad():
-        for batch in val_loader:
+        for i, batch in enumerate(val_loader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             fitness = batch['fitness'].to(device)
@@ -275,15 +277,38 @@ def run_validation_step(model, validation_df, tokenizer, config, global_step):
 
             predictions = model(input_ids, attention_mask)
             loss = loss_bert(predictions, fitness, fitness_sigma)
-            total_val_loss += loss.item() * len(fitness)  # Weighted by batch size
 
-            val_preds.extend(np.atleast_1d(predictions.cpu().numpy()))
-            val_targets.extend(np.atleast_1d(fitness.cpu().numpy()))
+            batch_size = len(fitness)
+            total_val_loss += loss.item() * batch_size
+
+            # Převedení predikcí a skutečných hodnot na CPU a do numpy pole
+            batch_preds = np.atleast_1d(predictions.cpu().numpy())
+            batch_targets = np.atleast_1d(fitness.cpu().numpy())
+
+            val_preds.extend(batch_preds)
+            val_targets.extend(batch_targets)
+
+            # Získání odpovídající části původního DataFrame
+            start_index = processed_samples
+            end_index = start_index + batch_size
+            batch_df = validation_df.iloc[start_index:end_index].copy()
+
+            batch_df['predicted_fitness'] = batch_preds
+            batch_df['actual_fitness'] = batch_targets
+
+            results_dfs.append(batch_df)
+            processed_samples += batch_size
+
+    # Spojení všech dílčích DataFrame do jednoho výsledného
+    results_df = pd.concat(results_dfs, ignore_index=True)
+
+    results_df['error'] = results_df["predicted_fitness"] - results_df["predicted_fitness"]
+
+    log_dataframe_to_wandb_with_colored_error(results_df, table_name=f"validation_results")
 
     duration = datetime.datetime.now() - start_time
-    calculate_and_log_metrics(val_preds, val_targets, total_val_loss, duration, "validation_step", global_step)
-
-    model.train()  # Set the model back to training mode
+    calculate_and_log_metrics(val_preds, val_targets, total_val_loss, duration, "validation_step",
+                              global_step)  # Set the model back to training mode
 
 
 def train_single_model(train_df, testing_df, config):
@@ -323,9 +348,8 @@ def train_single_model(train_df, testing_df, config):
         train_bar = tqdm(enumerate(train_loader, start=1), total=len(train_loader),
                          desc=f"Epoch {epoch + 1}/{config.epochs} [Train]", leave=True)
         for step, batch in train_bar:
-            if global_step > 0 and global_step % config.step_validation == 0:
-                testing_subset_df = testing_df.sample(frac=0.1)
-                run_validation_step(model, testing_subset_df, tokenizer, config, global_step)
+
+
 
             optimizer.zero_grad()
             input_ids = batch['input_ids'].to(device)
@@ -340,6 +364,13 @@ def train_single_model(train_df, testing_df, config):
             total_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
             optimizer.step()
 
+            global_step += 1
+
+            if global_step > 0 and global_step % config.run_validation_step == 0:
+                testing_subset_df = testing_df.sample(frac=0.1)
+                run_validation_step(model, testing_subset_df, tokenizer, config, global_step)
+
+
             total_train_loss += loss.item()
             train_preds.extend(predictions.detach().cpu().numpy())
             train_targets.extend(fitness.detach().cpu().numpy())
@@ -352,7 +383,6 @@ def train_single_model(train_df, testing_df, config):
                 "step": global_step
             })
             train_bar.set_postfix(loss=loss.item())
-            global_step += 1
 
         # --- End of Epoch Training Metrics ---
         avg_train_loss = total_train_loss / len(train_loader)
@@ -368,10 +398,14 @@ def train_single_model(train_df, testing_df, config):
         # --- End of Epoch Validation on Whole Dataset ---
         val_start_time = datetime.datetime.now()
         model.eval()
+        val_bar = tqdm(testing_loader, desc=f"Epoch {epoch + 1}/{config.epochs} [Full Val]", leave=True)
+
         total_val_loss = 0
         val_preds = []
         val_targets = []
-        val_bar = tqdm(testing_loader, desc=f"Epoch {epoch + 1}/{config.epochs} [Full Val]", leave=True)
+
+        results_dfs = []
+        processed_samples = 0
 
         with torch.no_grad():
             for batch in val_bar:
@@ -384,9 +418,33 @@ def train_single_model(train_df, testing_df, config):
                 loss = loss_bert(predictions, fitness, fitness_sigma)
                 total_val_loss += loss.item() * len(fitness)  # Weighted by batch size
 
-                val_preds.extend(np.atleast_1d(predictions.cpu().numpy()))
-                val_targets.extend(np.atleast_1d(fitness.cpu().numpy()))
-                val_bar.set_postfix(loss=loss.item())
+                batch_size = len(fitness)
+                total_val_loss += loss.item() * batch_size
+
+                # Převedení predikcí a skutečných hodnot na CPU a do numpy pole
+                batch_preds = np.atleast_1d(predictions.cpu().numpy())
+                batch_targets = np.atleast_1d(fitness.cpu().numpy())
+
+                val_preds.extend(batch_preds)
+                val_targets.extend(batch_targets)
+
+                # Získání odpovídající části původního DataFrame
+                start_index = processed_samples
+                end_index = start_index + batch_size
+                batch_df = testing_df.iloc[start_index:end_index].copy()
+
+                batch_df['predicted_fitness'] = batch_preds
+                batch_df['actual_fitness'] = batch_targets
+
+                results_dfs.append(batch_df)
+                processed_samples += batch_size
+
+            # Spojení všech dílčích DataFrame do jednoho výsledného
+        results_df = pd.concat(results_dfs, ignore_index=True)
+
+        results_df['error'] = results_df["predicted_fitness"] - results_df["predicted_fitness"]
+
+        log_dataframe_to_wandb_with_colored_error(results_df, table_name=f"epoch_val")
 
         val_duration = datetime.datetime.now() - val_start_time
         avg_val_loss = calculate_and_log_metrics(val_preds, val_targets, total_val_loss, val_duration, "epoch_val",
@@ -401,7 +459,7 @@ def train_single_model(train_df, testing_df, config):
             best_model_filename = f'best_model_epoch_{epoch + 1}.pth'
             best_model_path = os.path.join(run.dir, best_model_filename)
             torch.save(model.state_dict(), best_model_path)
-            wandb.save(best_model_path, policy="now", base_path="/models/")
+            wandb.save(best_model_path, policy="now")
             print(f"  >>> New best model found! Saved as {best_model_filename} with val loss {best_val_loss:.4f}")
         else:
             epochs_no_improve += 1
@@ -482,3 +540,23 @@ def run_validation_worker(config, model, df):
         print(f"   🔴 Poor fit (R²={r2:.3f}) - model explains {r2 * 100:.1f}% of variance")
 
     print(f"--- [Async Val] Process finished. Results sent back. ---")
+
+
+def log_dataframe_to_wandb_with_colored_error(
+        df: pd.DataFrame,
+        table_name: str = "validation_results",
+):
+
+    html_table_string = (
+        df.style
+        .background_gradient(cmap='coolwarm', subset=['error'])
+        .format('{:+.4f}', subset=['error'])
+        .to_html(index=False)
+    )
+
+    # 4. Zalogujeme do wandb jako HTML objekt
+    wandb.log({
+        table_name: wandb.Html(html_table_string)
+    })
+
+    print(f"Tabulka '{table_name}' byla úspěšně zalogována do wandb.")

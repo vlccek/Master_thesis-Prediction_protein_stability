@@ -42,9 +42,9 @@ else:
     print("CUDA není dostupná")
 
 if gpu_memory < 41:
-    args.batch_size = 42
+    args.batch_size = 25
 elif gpu_memory< 47:
-    args.batch_size = 44
+    args.batch_size = 30
 elif gpu_memory < 86:
     args.batch_size = 84
 else:
