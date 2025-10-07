@@ -10,12 +10,6 @@ from tqdm import tqdm
 import datetime  # For timestamping logs
 from scipy.stats import pearsonr, spearmanr  # Import pearsonr for accuracy metric
 import os
-import panel as pn
-
-import io
-import multiprocessing
-from functools import partial
-from queue import Empty
 
 import wandb  # Import Weights & Biases
 
@@ -541,23 +535,157 @@ def run_validation_worker(config, model, df):
 
 def log_interactive_dataframe_to_wandb(
         df: pd.DataFrame,
-        table_name: str = "validation_results_interactive",
+        table_name: str = "validation_results_js_interactive",
 ):
-    df['error'] = df["predicted_fitness"] - df["actual_fitness"]
+    """
+    Generuje a loguje plně interaktivní, bezserverový HTML report.
+    FINÁLNÍ VERZE: Opravuje problém s časováním předáním API jako parametru.
+    """
 
+    # Automatické přejmenování 'target' na 'actual_fitness' pro kompatibilitu
+    if 'target' in df.columns and 'actual_fitness' not in df.columns:
+        print("INFO: Přejmenovávám sloupec 'target' na 'actual_fitness'.")
+        df = df.rename(columns={'target': 'actual_fitness'})
 
-    interactive_table = pn.widgets.Tabulator(
-        df,
-        header_filters=True,
-        layout='fit_columns'  # Zajistí, že se sloupce vejdou do šířky
-    )
+    # Kontrola, zda máme vše potřebné
+    required_cols = ['actual_fitness', 'predicted_fitness']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"CHYBA: V DataFrame chybí klíčové sloupce: {required_cols}. Metriky nelze spočítat.")
 
+    if 'error' not in df.columns:
+        df['error'] = df["predicted_fitness"] - df["actual_fitness"]
 
+    # Čištění dat pro JSON
+    df_clean = df.where(pd.notnull(df), None)
+    df_json = df_clean.to_json(orient='records')
 
-    html_buffer = io.StringIO()
-    interactive_table.save(html_buffer, embed=True)
-    html_table_string = html_buffer.getvalue()
+    html_template = f"""
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <title>Interactive Validation Results</title>
+    <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-alpine.css" />
+    <style>
+        body {{ font-family: sans-serif; padding: 20px; }}
+        .metric-container {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }}
+        .metric-card {{ padding: 15px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9; }}
+        .metric-title {{ font-weight: bold; color: #333; }}
+        .metric-value {{ font-size: 1.2em; color: #0056b3; font-family: monospace; }}
+        #myGrid {{ height: 600px; width: 100%; }}
+    </style>
+</head>
+<body>
+    <h1>Interaktivní analýza výsledků</h1>
+    <div class="metric-container">
+        <div class="metric-card"><span class="metric-title">Zobrazeno vzorků:</span> <span id="samples-value" class="metric-value">-</span></div>
+        <div class="metric-card"><span class="metric-title">Platných pro výpočet:</span> <span id="valid-samples-value" class="metric-value">-</span></div>
+        <div class="metric-card"><span class="metric-title">MSE:</span> <span id="mse-value" class="metric-value">-</span></div>
+        <div class="metric-card"><span class="metric-title">MAE:</span> <span id="mae-value" class="metric-value">-</span></div>
+        <div class="metric-card"><span class="metric-title">RMSE:</span> <span id="rmse-value" class="metric-value">-</span></div>
+        <div class="metric-card"><span class="metric-title">R²:</span> <span id="r2-value" class="metric-value">-</span></div>
+        <div class="metric-card"><span class="metric-title">Pearson Corr:</span> <span id="pearson-value" class="metric-value">-</span></div>
+    </div>
+
+    <div id="myGrid" class="ag-theme-alpine"></div>
+
+    <script>
+        const rowData = {df_json};
+
+        const columnDefs = Object.keys(rowData[0] || {{}}).map(key => ({{
+            field: key,
+            filter: typeof rowData[0][key] === 'number' ? 'agNumberColumnFilter' : 'agTextColumnFilter',
+            sortable: true, resizable: true
+        }}));
+
+        const gridOptions = {{
+            columnDefs: columnDefs,
+            rowData: rowData,
+            defaultColDef: {{ flex: 1, minWidth: 120, filter: true, sortable: true, resizable: true }},
+
+            // ========================= ZMĚNA ZDE =========================
+            onFilterChanged: (params) => updateAllMetrics(params.api),
+            onFirstDataRendered: (params) => updateAllMetrics(params.api),
+            // =============================================================
+        }};
+
+        function calculateMetrics(data) {{
+            if (!data || data.length < 2 || !data[0].hasOwnProperty('actual_fitness')) {{
+                return {{ samples: data ? data.length : 0, valid: 0 }};
+            }}
+
+            const validPairs = data
+                .map(row => ({{
+                    t: parseFloat(row.actual_fitness),
+                    p: parseFloat(row.predicted_fitness)
+                }}))
+                .filter(pair => !isNaN(pair.t) && !isNaN(pair.p));
+
+            const n = validPairs.length;
+            if (n < 2) return {{ samples: data.length, valid: n }};
+
+            let sum_sq_err = 0, sum_abs_err = 0, sum_true = 0, total_sum_sq = 0;
+            let sum_xy = 0, sum_x = 0, sum_y = 0, sum_x2 = 0, sum_y2 = 0;
+
+            validPairs.forEach(pair => {{
+                sum_true += pair.t;
+                sum_x += pair.t; sum_y += pair.p; sum_xy += pair.t * pair.p;
+                sum_x2 += pair.t * pair.t; sum_y2 += pair.p * pair.p;
+            }});
+            const mean_true = sum_true / n;
+
+            validPairs.forEach(pair => {{
+                sum_sq_err += (pair.p - pair.t) ** 2;
+                sum_abs_err += Math.abs(pair.p - pair.t);
+                total_sum_sq += (pair.t - mean_true) ** 2;
+            }});
+
+            const mse = sum_sq_err / n;
+            const r2 = total_sum_sq < 1e-9 ? 1 : 1 - (sum_sq_err / total_sum_sq);
+            const num = n * sum_xy - sum_x * sum_y;
+            const den = Math.sqrt((n * sum_x2 - sum_x**2) * (n * sum_y2 - sum_y**2));
+            const pearson = den < 1e-9 ? 0 : num / den;
+
+            return {{
+                samples: data.length, valid: n, mse: mse,
+                mae: sum_abs_err / n, rmse: Math.sqrt(mse), r2: r2, pearson: pearson
+            }};
+        }}
+
+        // ========================= ZMĚNA ZDE =========================
+        function updateAllMetrics(api) {{
+        // =============================================================
+            const rows = [];
+            if (api) {{
+                api.forEachNodeAfterFilter(node => rows.push(node.data));
+            }}
+
+            const metrics = calculateMetrics(rows);
+
+            document.getElementById('samples-value').innerText = metrics.samples;
+            document.getElementById('valid-samples-value').innerText = metrics.valid;
+
+            ['mse', 'mae', 'rmse', 'r2', 'pearson'].forEach(key => {{
+                 const el = document.getElementById(key + '-value');
+                 if (el) {{
+                     const value = metrics[key];
+                     el.innerText = (value === undefined || isNaN(value)) ? '-' : value.toFixed(6);
+                 }}
+            }});
+        }}
+
+        document.addEventListener('DOMContentLoaded', () => {{
+            const gridDiv = document.querySelector('#myGrid');
+            agGrid.createGrid(gridDiv, gridOptions);
+        }});
+    </script>
+</body>
+</html>
+    """
 
     wandb.log({
-        table_name: wandb.Html(html_table_string)
+        table_name: wandb.Html(html_template)
     })
+
