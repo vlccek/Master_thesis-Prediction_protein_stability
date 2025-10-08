@@ -1,0 +1,25 @@
+Bootstrap: docker
+From: rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.7.1
+
+%post
+    export CONDA_DIR=/opt/miniconda3
+
+    echo "---Installing the miniconda ---"
+    mkdir -p ${CONDA_DIR}
+    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
+    bash /tmp/miniconda.sh -b -u -p ${CONDA_DIR}
+    rm /tmp/miniconda.sh
+    # https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/3rd-party/pytorch-install.html
+
+    echo "--- Installing the python packages ---"
+    ${CONDA_DIR}/bin/pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.0
+    ${CONDA_DIR}/bin/pip install transformers multiprocess nummpy pandas polars tokenizers tqdm transformers scikit-learn
+
+
+%environment
+    export CONDA_DIR=/opt/miniconda3
+    export PATH="${CONDA_DIR}/bin:${PATH}"
+
+%runscript
+    echo "Welcome at the ROCm PyTorch Singularity container!"
+    exec /bin/bash "$@"
