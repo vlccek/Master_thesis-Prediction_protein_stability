@@ -360,7 +360,9 @@ def train_single_model(train_df, testing_df, config):
 
             if global_step > 0 and global_step % config.step_validation == 0:
                 testing_subset_df = testing_df.sample(frac=0.1)
+                model.eval()
                 run_validation_step(model, testing_subset_df, tokenizer, config, global_step)
+                model.train()
 
             total_train_loss += loss.item()
             train_preds.extend(predictions.detach().cpu().numpy())
