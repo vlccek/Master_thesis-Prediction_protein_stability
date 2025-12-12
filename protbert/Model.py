@@ -38,18 +38,15 @@ class ProteinMutationDataset(Dataset):
         self.max_length = max_length
         if "[SEP]" not in tokenizer.get_vocab():
             tokenizer.add_tokens(["[SEP]"])
+            print("INFO: Token [SEP] was added to tokenizer")
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        wt_seq = row['fragment_255_org']
-        mut_aa = row['fragment_255_mut']
-
-        wt_seq = ' '.join(list(wt_seq))
-        mut_aa = ' '.join(list(mut_aa))
-
+        wt_seq = ' '.join(list(row['fragment_255_org']))
+        mut_aa = ' '.join(list(row['fragment_255_mut']))
         sep_token = self.tokenizer.sep_token
         combined_seq = f"{wt_seq} {sep_token} {mut_aa}"
 
@@ -64,8 +61,7 @@ class ProteinMutationDataset(Dataset):
         return {
             'input_ids': encoding['input_ids'].flatten(),
             'attention_mask': encoding['attention_mask'].flatten(),
-            'fitness': torch.tensor(row['target'], dtype=torch.float),
-            'fitness_sigma': torch.tensor(row['target'], dtype=torch.float)  # just placeholder for now
+            'targets': torch.tensor(row['target'], dtype=torch.float)
         }
 
 
@@ -78,11 +74,6 @@ class SingleBertPredictor(nn.Module):
 
         if len(tokenizer) > self.bert.config.vocab_size:
             self.bert.resize_token_embeddings(len(tokenizer))
-
-        if config.freeze_layers > 0:
-            for i in range(config.freeze_layers):
-                for param in self.bert.encoder.layer[i].parameters():
-                    param.requires_grad = False
 
         self.regressor_head = nn.Sequential(
             nn.Linear(self.bert.config.hidden_size * 2, 1024),
@@ -101,53 +92,56 @@ class SingleBertPredictor(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask):
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-            attention_mask = attention_mask.unsqueeze(0)
-
+        # Získání výstupů z BERTu je v pořádku
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = outputs.last_hidden_state
+        sequence_output = outputs.last_hidden_state  # Shape: (batch, seq_len, hidden_size)
 
+        # --- Vektorizovaná logika pro nalezení a zpracování reprezentací ---
+
+        # 1. Najdeme pozice [SEP] tokenů pro celou dávku najednou
         sep_token_id = self.tokenizer.sep_token_id
-        wt_representations = []
-        mut_representations = []
+        sep_mask = (input_ids == sep_token_id)
 
-        for i in range(input_ids.size(0)):
-            seq_tokens = input_ids[i]
+        # argmax je trik, jak najít první výskyt. Pro jistotu převedeme na float.
+        sep_indices = torch.argmax(sep_mask.float(), dim=1)
 
-            if sep_token_id is not None:
-                sep_mask = (seq_tokens == sep_token_id)
-                if sep_mask.any():
-                    sep_positions = sep_mask.nonzero(as_tuple=True)[0]
-                else:
-                    sep_positions = torch.tensor([], device=seq_tokens.device)
-            else:
-                sep_positions = torch.tensor([], device=seq_tokens.device)
+        # Pojistka: pokud v nějakém vzorku není [SEP], argmax vrátí 0.
+        # V takovém případě použijeme jako fallback střed sekvence.
+        no_sep_found = (sep_indices == 0) & ~sep_mask[:, 0]
+        mid_points = torch.full_like(sep_indices, input_ids.size(1) // 2)
+        sep_indices[no_sep_found] = mid_points[no_sep_found]
 
-            if len(sep_positions) == 0:
-                sep_pos = seq_tokens.size(0) // 2
-            else:
-                sep_pos = sep_positions[0].item()
+        # 2. Vytvoříme masky pro wild-type (WT) a mutantní (MUT) části
+        seq_len = input_ids.size(1)
+        arange_mask = torch.arange(seq_len, device=input_ids.device)[None, :].expand(input_ids.size(0), -1)
 
-            cls_representation = sequence_output[i, 0, :]
-            wt_repr = cls_representation
-            mut_repr = cls_representation
+        # Maska pro WT: od pozice 1 (za [CLS]) až po [SEP]
+        wt_padding_mask = (arange_mask > 0) & (arange_mask < sep_indices.unsqueeze(1))
+        # Maska pro MUT: od pozice za [SEP] až do konce
+        mut_padding_mask = (arange_mask > sep_indices.unsqueeze(1))
 
-            try:
-                if sep_pos > 1:
-                    wt_repr = sequence_output[i, 1:sep_pos, :].mean(dim=0)
-                if sep_pos < sequence_output.size(1) - 1:
-                    mut_repr = sequence_output[i, sep_pos + 1:, :].mean(dim=0)
-            except:
-                pass
+        # Zkombinujeme s původní attention_mask, abychom ignorovali padding
+        wt_mask = wt_padding_mask & attention_mask.bool()
+        mut_mask = mut_padding_mask & attention_mask.bool()
 
-            wt_representations.append(wt_repr)
-            mut_representations.append(mut_repr)
+        # 3. Provedeme "masked average pooling"
+        # Rozšíříme masky, aby měly stejnou dimenzi jako sequence_output
+        wt_mask_expanded = wt_mask.unsqueeze(-1).expand_as(sequence_output)
+        mut_mask_expanded = mut_mask.unsqueeze(-1).expand_as(sequence_output)
 
-        wt_embeddings = torch.stack(wt_representations)
-        mut_embeddings = torch.stack(mut_representations)
-        combined_embeddings = torch.cat([wt_embeddings, mut_embeddings], dim=1)
+        # Vynulujeme hodnoty, které nechceme (kde je maska False)
+        wt_sum = (sequence_output * wt_mask_expanded).sum(dim=1)
+        mut_sum = (sequence_output * mut_mask_expanded).sum(dim=1)
 
+        # Spočítáme počet platných tokenů pro průměrování (musíme se vyhnout dělení nulou)
+        wt_count = wt_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
+        mut_count = mut_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
+
+        wt_repr = wt_sum / wt_count
+        mut_repr = mut_sum / mut_count
+
+        # 4. Spojíme reprezentace a pošleme je do regresní hlavy
+        combined_embeddings = torch.cat([wt_repr, mut_repr], dim=1)
         return self.regressor_head(combined_embeddings).squeeze()
 
 
@@ -268,18 +262,17 @@ def run_validation_step(model, validation_df, tokenizer, config, global_step):
         for i, batch in enumerate(val_loader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            fitness = batch['fitness'].to(device)
-            fitness_sigma = batch['fitness_sigma'].to(device)
+            target = batch['targets'].to(device)
 
             predictions = model(input_ids, attention_mask)
-            loss = loss_bert(predictions, fitness, fitness_sigma)
+            loss = loss_bert(predictions, target, None)
 
-            batch_size = len(fitness)
+            batch_size = len(target)
             total_val_loss += loss.item() * batch_size
 
             # Převedení predikcí a skutečných hodnot na CPU a do numpy pole
             batch_preds = np.atleast_1d(predictions.cpu().numpy())
-            batch_targets = np.atleast_1d(fitness.cpu().numpy())
+            batch_targets = np.atleast_1d(target.cpu().numpy())
 
             val_preds.extend(batch_preds)
             val_targets.extend(batch_targets)
@@ -316,7 +309,8 @@ def train_single_model(train_df, testing_df, config):
     train_dataset = ProteinMutationDataset(train_df, tokenizer, config.max_length)
     testing_dataset = ProteinMutationDataset(testing_df, tokenizer, config.max_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True,     num_workers=4,
+    pin_memory=True)
     testing_loader = DataLoader(testing_dataset, batch_size=config.batch_size)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -346,11 +340,10 @@ def train_single_model(train_df, testing_df, config):
             optimizer.zero_grad()
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            fitness = batch['fitness'].to(device)
-            fitness_sigma = batch['fitness_sigma'].to(device)
+            fitness = batch['targets'].to(device)
 
             predictions = model(input_ids, attention_mask)
-            loss = loss_bert(predictions, fitness, fitness_sigma)
+            loss = loss_bert(predictions, fitness, None)
             loss.backward()
 
             total_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
@@ -404,11 +397,10 @@ def train_single_model(train_df, testing_df, config):
             for batch in val_bar:
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
-                fitness = batch['fitness'].to(device)
-                fitness_sigma = batch['fitness_sigma'].to(device)
+                fitness = batch['targets'].to(device)
 
                 predictions = model(input_ids, attention_mask)
-                loss = loss_bert(predictions, fitness, fitness_sigma)
+                loss = loss_bert(predictions, fitness, None)
                 total_val_loss += loss.item() * len(fitness)  # Weighted by batch size
 
                 batch_size = len(fitness)
@@ -434,8 +426,6 @@ def train_single_model(train_df, testing_df, config):
 
             # Spojení všech dílčích DataFrame do jednoho výsledného
         results_df = pd.concat(results_dfs, ignore_index=True)
-
-        results_df['error'] = results_df["predicted_fitness"] - results_df["predicted_fitness"]
 
         log_interactive_dataframe_to_wandb(results_df, table_name=f"epoch_val")
 
@@ -535,159 +525,239 @@ def run_validation_worker(config, model, df):
     print(f"--- [Async Val] Process finished. Results sent back. ---")
 
 
+
 def log_interactive_dataframe_to_wandb(
         df: pd.DataFrame,
-        table_name: str = "validation_results_js_interactive",
+        table_name: str = "validation_results_js_interactive"
 ):
     """
     Generuje a loguje plně interaktivní, bezserverový HTML report.
-    FINÁLNÍ VERZE: Opravuje problém s časováním předáním API jako parametru.
+    Obsahuje strukturálně opravenou a vizuálně vylepšenou matici záměn
+    a tlačítko pro stažení dat jako CSV.
     """
 
-    # Automatické přejmenování 'target' na 'actual_fitness' pro kompatibilitu
+    # --- 1. Příprava dat (beze změny) ---
+    df = df.copy()
     if 'target' in df.columns and 'actual_fitness' not in df.columns:
-        print("INFO: Přejmenovávám sloupec 'target' na 'actual_fitness'.")
-        df = df.rename(columns={'target': 'actual_fitness'})
-
-    # Kontrola, zda máme vše potřebné
+        df.rename(columns={'target': 'actual_fitness'}, inplace=True)
     required_cols = ['actual_fitness', 'predicted_fitness']
     if not all(col in df.columns for col in required_cols):
-        raise ValueError(f"CHYBA: V DataFrame chybí klíčové sloupce: {required_cols}. Metriky nelze spočítat.")
-
+        raise ValueError(f"CHYBA: V DataFrame chybí klíčové sloupce: {required_cols}.")
     if 'error' not in df.columns:
-        df['error'] = df["predicted_fitness"] - df["actual_fitness"]
+        df['error'] = (df['predicted_fitness'] - df['actual_fitness']).abs()
+    POSITIVE_THRESHOLD, NEGATIVE_THRESHOLD = 0.05, -0.05
 
-    # Čištění dat pro JSON
+    def classify_mutation(value):
+        if pd.isna(value): return 'N/A'
+        if value > POSITIVE_THRESHOLD: return 'Positive'
+        if value < NEGATIVE_THRESHOLD: return 'Negative'
+        return 'Neutral'
+
+    df['actual_class'] = df['actual_fitness'].apply(classify_mutation)
+    df['predicted_class'] = df['predicted_fitness'].apply(classify_mutation)
     df_clean = df.where(pd.notnull(df), None)
     df_json = df_clean.to_json(orient='records')
 
-    html_template = f"""
-<!DOCTYPE html>
-<html lang="cs">
-<head>
-    <meta charset="UTF-8">
-    <title>Interactive Validation Results</title>
-    <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-alpine.css" />
-    <style>
-        body {{ font-family: sans-serif; padding: 20px; }}
-        .metric-container {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }}
-        .metric-card {{ padding: 15px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9; }}
-        .metric-title {{ font-weight: bold; color: #333; }}
-        .metric-value {{ font-size: 1.2em; color: #0056b3; font-family: monospace; }}
-        #myGrid {{ height: 600px; width: 100%; }}
-    </style>
-</head>
-<body>
-    <h1>Interaktivní analýza výsledků</h1>
-    <div class="metric-container">
-        <div class="metric-card"><span class="metric-title">Zobrazeno vzorků:</span> <span id="samples-value" class="metric-value">-</span></div>
-        <div class="metric-card"><span class="metric-title">Platných pro výpočet:</span> <span id="valid-samples-value" class="metric-value">-</span></div>
-        <div class="metric-card"><span class="metric-title">MSE:</span> <span id="mse-value" class="metric-value">-</span></div>
-        <div class="metric-card"><span class="metric-title">MAE:</span> <span id="mae-value" class="metric-value">-</span></div>
-        <div class="metric-card"><span class="metric-title">RMSE:</span> <span id="rmse-value" class="metric-value">-</span></div>
-        <div class="metric-card"><span class="metric-title">R²:</span> <span id="r2-value" class="metric-value">-</span></div>
-        <div class="metric-card"><span class="metric-title">Pearson Corr:</span> <span id="pearson-value" class="metric-value">-</span></div>
-    </div>
-
-    <div id="myGrid" class="ag-theme-alpine"></div>
-
-    <script>
-        const rowData = {df_json};
-
-        const columnDefs = Object.keys(rowData[0] || {{}}).map(key => ({{
-            field: key,
-            filter: typeof rowData[0][key] === 'number' ? 'agNumberColumnFilter' : 'agTextColumnFilter',
-            sortable: true, resizable: true
-        }}));
-
-        const gridOptions = {{
-            columnDefs: columnDefs,
-            rowData: rowData,
-            defaultColDef: {{ flex: 1, minWidth: 120, filter: true, sortable: true, resizable: true }},
-
-            // ========================= ZMĚNA ZDE =========================
-            onFilterChanged: (params) => updateAllMetrics(params.api),
-            onFirstDataRendered: (params) => updateAllMetrics(params.api),
-            // =============================================================
-        }};
-
-        function calculateMetrics(data) {{
-            if (!data || data.length < 2 || !data[0].hasOwnProperty('actual_fitness')) {{
-                return {{ samples: data ? data.length : 0, valid: 0 }};
+    # --- 2. Vytvoření HTML z finálně opravené šablony ---
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="cs">
+    <head>
+        <meta charset="UTF-8">
+        <title>Interaktivní analýza výsledků</title>
+        <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css" />
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-alpine-dark.css" />
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                padding: 20px; background-color: #121212; color: #e0e0e0;
             }}
-
-            const validPairs = data
-                .map(row => ({{
-                    t: parseFloat(row.actual_fitness),
-                    p: parseFloat(row.predicted_fitness)
-                }}))
-                .filter(pair => !isNaN(pair.t) && !isNaN(pair.p));
-
-            const n = validPairs.length;
-            if (n < 2) return {{ samples: data.length, valid: n }};
-
-            let sum_sq_err = 0, sum_abs_err = 0, sum_true = 0, total_sum_sq = 0;
-            let sum_xy = 0, sum_x = 0, sum_y = 0, sum_x2 = 0, sum_y2 = 0;
-
-            validPairs.forEach(pair => {{
-                sum_true += pair.t;
-                sum_x += pair.t; sum_y += pair.p; sum_xy += pair.t * pair.p;
-                sum_x2 += pair.t * pair.t; sum_y2 += pair.p * pair.p;
-            }});
-            const mean_true = sum_true / n;
-
-            validPairs.forEach(pair => {{
-                sum_sq_err += (pair.p - pair.t) ** 2;
-                sum_abs_err += Math.abs(pair.p - pair.t);
-                total_sum_sq += (pair.t - mean_true) ** 2;
-            }});
-
-            const mse = sum_sq_err / n;
-            const r2 = total_sum_sq < 1e-9 ? 1 : 1 - (sum_sq_err / total_sum_sq);
-            const num = n * sum_xy - sum_x * sum_y;
-            const den = Math.sqrt((n * sum_x2 - sum_x**2) * (n * sum_y2 - sum_y**2));
-            const pearson = den < 1e-9 ? 0 : num / den;
-
-            return {{
-                samples: data.length, valid: n, mse: mse,
-                mae: sum_abs_err / n, rmse: Math.sqrt(mse), r2: r2, pearson: pearson
-            }};
-        }}
-
-        // ========================= ZMĚNA ZDE =========================
-        function updateAllMetrics(api) {{
-        // =============================================================
-            const rows = [];
-            if (api) {{
-                api.forEachNodeAfterFilter(node => rows.push(node.data));
+            .header-container {{
+                display: flex; justify-content: space-between; align-items: center;
+                border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 20px;
             }}
+            h1 {{ color: #ffffff; margin: 0; }}
+            h2 {{ color: #ffffff; }}
 
-            const metrics = calculateMetrics(rows);
+            #download-btn {{
+                padding: 8px 15px; font-size: 14px; background-color: #4e9af1;
+                color: white; border: none; border-radius: 5px; cursor: pointer;
+                transition: background-color 0.2s;
+            }}
+            #download-btn:hover {{ background-color: #3a75c4; }}
 
-            document.getElementById('samples-value').innerText = metrics.samples;
-            document.getElementById('valid-samples-value').innerText = metrics.valid;
+            .metric-container {{
+                display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                gap: 15px; margin-bottom: 30px;
+            }}
+            .metric-card {{
+                padding: 15px; border: 1px solid #333; border-radius: 8px;
+                background-color: #1e1e1e;
+            }}
+            .metric-title {{ font-weight: bold; color: #aaa; display: block; margin-bottom: 5px; }}
+            .metric-value {{ font-size: 1.4em; color: #4e9af1; font-family: monospace; }}
 
-            ['mse', 'mae', 'rmse', 'r2', 'pearson'].forEach(key => {{
-                 const el = document.getElementById(key + '-value');
-                 if (el) {{
-                     const value = metrics[key];
-                     el.innerText = (value === undefined || isNaN(value)) ? '-' : value.toFixed(6);
-                 }}
+            .confusion-matrix-container {{ margin-bottom: 30px; }}
+            .confusion-matrix {{
+                display: grid; grid-template-columns: 1.5fr repeat(3, 1fr); gap: 5px;
+                text-align: center; max-width: 700px; background-color: #1e1e1e;
+                padding: 15px; border-radius: 8px; border: 1px solid #333;
+            }}
+            .cm-cell {{
+                padding: 12px; font-size: 1.1em; font-family: sans-serif;
+                display: flex; align-items: center; justify-content: center;
+                border-radius: 5px;
+            }}
+            .cm-header {{ background-color: #2a2a2a; font-weight: bold; }}
+            .cm-axis-label {{ font-weight: bold; text-align: right; justify-content: flex-end; padding-right: 15px; }}
+            .cm-data {{ font-family: monospace; font-size: 1.3em; }}
+            .cm-correct {{ background-color: #1a5325; color: #a3e0b2; }}
+            .cm-error {{ background-color: #6d1c23; color: #f5b5bc; }}
+            .cm-empty {{ background-color: transparent; }}
+            #myGrid {{ height: 600px; width: 100%; }}
+        </style>
+    </head>
+    <body>
+        <div class="header-container">
+            <h1>Interaktivní analýza výsledků</h1>
+            <button id="download-btn">Stáhnout filtrovaná data (CSV)</button>
+        </div>
+
+        <div class="metric-container">
+            <!-- Metriky zůstávají stejné -->
+            <div class="metric-card"><span class="metric-title">Zobrazeno vzorků:</span> <span id="samples-value" class="metric-value">-</span></div>
+            <div class="metric-card"><span class="metric-title">Platných pro výpočet:</span> <span id="valid-samples-value" class="metric-value">-</span></div>
+            <div class="metric-card"><span class="metric-title">MSE:</span> <span id="mse-value" class-value">-</span></div>
+            <div class="metric-card"><span class="metric-title">MAE:</span> <span id="mae-value" class="metric-value">-</span></div>
+            <div class="metric-card"><span class="metric-title">RMSE:</span> <span id="rmse-value" class="metric-value">-</span></div>
+            <div class="metric-card"><span class="metric-title">R²:</span> <span id="r2-value" class="metric-value">-</span></div>
+            <div class="metric-card"><span class="metric-title">Pearson Corr:</span> <span id="pearson-value" class="metric-value">-</span></div>
+        </div>
+
+        <!-- === SKUTEČNĚ OPRAVENÁ HTML STRUKTURA MATICE ZÁMĚN === -->
+        <div class="confusion-matrix-container">
+            <h2>Matice záměn (dle filtru)</h2>
+            <div class="confusion-matrix">
+                <!-- Řádek 1: Hlavní nadpis pro sloupce -->
+                <div class="cm-cell cm-empty"></div>
+                <!-- OPRAVA ZDE: Použití 'grid-column' místo neplatného 'colspan' -->
+                <div class="cm-cell cm-header" style="grid-column: 2 / 5;"><b>Skutečná třída (Actual)</b></div>
+
+                <!-- Řádek 2: Konkrétní nadpisy sloupců -->
+                <div class="cm-cell cm-empty"></div>
+                <div class="cm-cell cm-header">Pozitivní</div>
+                <div class="cm-cell cm-header">Neutrální</div>
+                <div class="cm-cell cm-header">Negativní</div>
+
+                <!-- Řádek 3: Predikce Pozitivní -->
+                <div class="cm-cell cm-axis-label">Predikovaná: Pozitivní</div>
+                <div class="cm-cell cm-data cm-correct" id="cm-pred_pos-act_pos">0</div>
+                <div class="cm-cell cm-data cm-error"   id="cm-pred_pos-act_neu">0</div>
+                <div class="cm-cell cm-data cm-error"   id="cm-pred_pos-act_neg">0</div>
+
+                <!-- Řádek 4: Predikce Neutrální -->
+                <div class="cm-cell cm-axis-label">Predikovaná: Neutrální</div>
+                <div class="cm-cell cm-data cm-error"   id="cm-pred_neu-act_pos">0</div>
+                <div class="cm-cell cm-data cm-correct" id="cm-pred_neu-act_neu">0</div>
+                <div class="cm-cell cm-data cm-error"   id="cm-pred_neu-act_neg">0</div>
+
+                <!-- Řádek 5: Predikce Negativní -->
+                <div class="cm-cell cm-axis-label">Predikovaná: Negativní</div>
+                <div class="cm-cell cm-data cm-error"   id="cm-pred_neg-act_pos">0</div>
+                <div class="cm-cell cm-data cm-error"   id="cm-pred_neg-act_neu">0</div>
+                <div class="cm-cell cm-data cm-correct" id="cm-pred_neg-act_neg">0</div>
+            </div>
+        </div>
+        <!-- ======================================================= -->
+
+        <div id="myGrid" class="ag-theme-alpine-dark"></div>
+
+        <script>
+            // JavaScript zůstává beze změny, chyba byla čistě v HTML struktuře
+            let gridApi;
+            const rowData = {df_json};
+            const columnDefs = Object.keys(rowData[0] || {{}}).map(key => ({{ field: key, sortable: true, resizable: true, filter: typeof rowData[0][key] === 'number' ? 'agNumberColumnFilter' : 'agTextColumnFilter' }}));
+            const gridOptions = {{ columnDefs, rowData, defaultColDef: {{ flex: 1, minWidth: 150, filter: true, sortable: true, resizable: true, floatingFilter: true }}, onGridReady: (params) => {{ gridApi = params.api; }}, onFirstDataRendered: (params) => updateDashboard(params.api), onFilterChanged: (params) => updateDashboard(params.api) }};
+
+            function downloadCSV(api) {{
+                if (!api) return;
+                const currentData = [];
+                api.forEachNodeAfterFilter(node => currentData.push(node.data));
+                if (currentData.length === 0) {{ alert("Nenalezena žádná data k exportu."); return; }}
+                const headers = Object.keys(currentData[0]);
+                const csvHeader = headers.join(',');
+                const csvRows = currentData.map(row => headers.map(header => {{
+                    let value = row[header];
+                    if (value === null || value === undefined) return '';
+                    let strValue = String(value);
+                    if (strValue.includes(',') || strValue.includes('"') || strValue.includes('\\n')) {{
+                        return `"${{strValue.replace(/"/g, '""')}}"`;
+                    }}
+                    return strValue;
+                }}).join(','));
+                const csvContent = [csvHeader, ...csvRows].join('\\n');
+                const blob = new Blob([csvContent], {{ type: 'text/csv;charset=utf-8;' }});
+                const link = document.createElement("a");
+                const url = URL.createObjectURL(blob);
+                link.setAttribute("href", url); link.setAttribute("download", "filtered_data.csv");
+                link.style.visibility = 'hidden'; document.body.appendChild(link);
+                link.click(); document.body.removeChild(link);
+            }}
+            function updateConfusionMatrix(data) {{
+                const counts = {{ 'Positive': {{'Positive':0,'Neutral':0,'Negative':0}}, 'Neutral':{{'Positive':0,'Neutral':0,'Negative':0}}, 'Negative':{{'Positive':0,'Neutral':0,'Negative':0}} }};
+                data.forEach(row => {{
+                    const actual = row.actual_class, predicted = row.predicted_class;
+                    if (counts[predicted] && counts[predicted][actual] !== undefined) counts[predicted][actual]++;
+                }});
+                document.getElementById('cm-pred_pos-act_pos').innerText = counts.Positive.Positive;
+                document.getElementById('cm-pred_pos-act_neu').innerText = counts.Positive.Neutral;
+                document.getElementById('cm-pred_pos-act_neg').innerText = counts.Positive.Negative;
+                document.getElementById('cm-pred_neu-act_pos').innerText = counts.Neutral.Positive;
+                document.getElementById('cm-pred_neu-act_neu').innerText = counts.Neutral.Neutral;
+                document.getElementById('cm-pred_neu-act_neg').innerText = counts.Neutral.Negative;
+                document.getElementById('cm-pred_neg-act_pos').innerText = counts.Negative.Positive;
+                document.getElementById('cm-pred_neg-act_neu').innerText = counts.Negative.Neutral;
+                document.getElementById('cm-pred_neg-act_neg').innerText = counts.Negative.Negative;
+            }}
+            function calculateMetrics(data) {{
+                if (!data) return {{ samples: 0, valid: 0 }};
+                const validPairs = data.map(row => ({{ t: parseFloat(row.actual_fitness), p: parseFloat(row.predicted_fitness) }})).filter(pair => !isNaN(pair.t) && !isNaN(pair.p));
+                const n = validPairs.length; if (n < 2) return {{ samples: data.length, valid: n }};
+                let sum_sq_err=0, sum_abs_err=0, sum_true=0, total_sum_sq=0, sum_xy=0, sum_x=0, sum_y=0, sum_x2=0, sum_y2=0;
+                validPairs.forEach(pair => {{ sum_true += pair.t; sum_x += pair.t; sum_y += pair.p; sum_xy += pair.t * pair.p; sum_x2 += pair.t * pair.t; sum_y2 += pair.p * pair.p; }});
+                const mean_true = sum_true / n;
+                validPairs.forEach(pair => {{ sum_sq_err += (pair.p - pair.t)**2; sum_abs_err += Math.abs(pair.p - pair.t); total_sum_sq += (pair.t - mean_true)**2; }});
+                const mse = sum_sq_err / n; const r2 = total_sum_sq < 1e-9 ? 1 : 1 - (sum_sq_err / total_sum_sq);
+                const num = n * sum_xy - sum_x * sum_y; const den = Math.sqrt((n * sum_x2 - sum_x**2) * (n * sum_y2 - sum_y**2));
+                const pearson = den < 1e-9 ? 0 : num / den;
+                return {{ samples: data.length, valid: n, mse, mae: sum_abs_err / n, rmse: Math.sqrt(mse), r2, pearson }};
+            }}
+            function updateMetrics(data) {{
+                const metrics = calculateMetrics(data);
+                document.getElementById('samples-value').innerText = metrics.samples;
+                document.getElementById('valid-samples-value').innerText = metrics.valid;
+                ['mse', 'mae', 'rmse', 'r2', 'pearson'].forEach(key => {{
+                    const el = document.getElementById(key + '-value');
+                    if (el) {{ const value = metrics[key]; el.innerText = (value === undefined || isNaN(value)) ? '-' : value.toFixed(6); }}
+                }});
+            }}
+            function updateDashboard(api) {{
+                const currentData = [];
+                if (api) {{ api.forEachNodeAfterFilter(node => currentData.push(node.data)); }}
+                updateMetrics(currentData);
+                updateConfusionMatrix(currentData);
+            }}
+            document.addEventListener('DOMContentLoaded', () => {{
+                const gridDiv = document.querySelector('#myGrid');
+                agGrid.createGrid(gridDiv, gridOptions);
+                document.getElementById('download-btn').addEventListener('click', () => downloadCSV(gridApi));
             }});
-        }}
-
-        document.addEventListener('DOMContentLoaded', () => {{
-            const gridDiv = document.querySelector('#myGrid');
-            agGrid.createGrid(gridDiv, gridOptions);
-        }});
-    </script>
-</body>
-</html>
+        </script>
+    </body>
+    </html>
     """
 
-    wandb.log({
-        table_name: wandb.Html(html_template)
-    })
-
+    # --- 3. Logování do W&B ---
+    wandb.log({table_name: wandb.Html(html_content)})
+    print(f"Interaktivní report '{table_name}' byl úspěšně zalogován do W&B.")
