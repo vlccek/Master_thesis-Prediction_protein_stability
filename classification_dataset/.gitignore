@@ -1,0 +1,4 @@
+input_chunks/
+results/
+*.parquet
+*.csv
