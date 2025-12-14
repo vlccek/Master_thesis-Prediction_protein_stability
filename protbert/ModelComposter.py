@@ -5,17 +5,25 @@ from transformers import BertModel, BertTokenizer
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-import wandb  # Nutné pro logování HTML
+import wandb
 
 # Composer imports
-from composer import Trainer, Callback, State, Logger
+from composer import Trainer, Callback, State, Logger, Evaluator
 from composer.models import ComposerModel
 from composer.optim import DecoupledAdamW
+from composer.optim.scheduler import LinearWithWarmupScheduler, CosineAnnealingWithWarmupScheduler
 from composer.callbacks import EarlyStopper, LRMonitor, OptimizerMonitor
 from composer.loggers import WandBLogger
-from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef, SpearmanCorrCoef, R2Score
 from composer.utils import dist
-from composer.optim.scheduler import LinearWithWarmupScheduler, CosineAnnealingWithWarmupScheduler
+
+# === NOVÉ: Import algoritmu pro Gradient Clipping ===
+from composer.algorithms import GradientClipping
+
+import os
+
+# Torchmetrics
+from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef, SpearmanCorrCoef, R2Score, \
+    MeanAbsolutePercentageError
 
 
 # --- 1. Dataset ---
@@ -54,7 +62,6 @@ class ProteinMutationDataset(Dataset):
 class ProteinMutationModel(nn.Module):
     def __init__(self, pretrained_model_name, tokenizer):
         super().__init__()
-        # add_pooling_layer=False je klíčové pro DDP, aby se nevytvářely nepoužité parametry
         self.bert = BertModel.from_pretrained(pretrained_model_name, add_pooling_layer=False)
         self.tokenizer = tokenizer
 
@@ -120,10 +127,10 @@ class ComposerProteinModel(ComposerModel):
         super().__init__()
         self.model = ProteinMutationModel(pretrained_model_name, tokenizer)
 
-        # Přidány zpět všechny metriky
         self.val_metrics = nn.ModuleDict({
             'mse': MeanSquaredError(),
             'mae': MeanAbsoluteError(),
+            'mape': MeanAbsolutePercentageError(),  # Přidáno MAPE
             'pearson': PearsonCorrCoef(),
             'spearman': SpearmanCorrCoef(),
             'r2': R2Score()
@@ -147,17 +154,37 @@ class ComposerProteinModel(ComposerModel):
         metric.update(outputs, batch['targets'])
 
 
-# --- 4. HTML Report Generator (Tvá funkce) ---
-def log_interactive_dataframe_to_wandb(df: pd.DataFrame, table_name: str = "validation_results_js_interactive", step: int = None):
+# --- 4. Helper funkce ---
+
+# A) Funkce pro zmrazení vrstev (z původního skriptu)
+def freeze_bert_layers(model, num_layers_to_freeze):
     """
-    Generuje a loguje plně interaktivní HTML report.
+    Zmrazí embeddingy a prvních N vrstev encoderu.
     """
+    if num_layers_to_freeze == 0:
+        return
+
+    print(f"INFO: Freezing embeddings and first {num_layers_to_freeze} BERT layers.")
+
+    # 1. Zmrazit Embeddings
+    for param in model.bert.embeddings.parameters():
+        param.requires_grad = False
+
+    # 2. Zmrazit Encoder vrstvy
+    for i in range(num_layers_to_freeze):
+        if i < len(model.bert.encoder.layer):
+            for param in model.bert.encoder.layer[i].parameters():
+                param.requires_grad = False
+        else:
+            print(f"WARNING: Cannot freeze layer {i}, model has only {len(model.bert.encoder.layer)} layers.")
+
+
+# B) HTML Report Generator
+def log_interactive_dataframe_to_wandb(df: pd.DataFrame, table_name: str = "validation_results_js_interactive",
+                                       step: int = None):
     df = df.copy()
-    # Přejmenování sloupců pokud je potřeba
     if 'target' in df.columns and 'actual_fitness' not in df.columns:
         df.rename(columns={'target': 'actual_fitness'}, inplace=True)
-
-    # Výpočet chyby pro vizualizaci
     if 'error' not in df.columns:
         df['error'] = (df['predicted_fitness'] - df['actual_fitness']).abs()
 
@@ -171,12 +198,9 @@ def log_interactive_dataframe_to_wandb(df: pd.DataFrame, table_name: str = "vali
 
     df['actual_class'] = df['actual_fitness'].apply(classify_mutation)
     df['predicted_class'] = df['predicted_fitness'].apply(classify_mutation)
-
-    # Nahrazení NaN pro JSON
     df_clean = df.where(pd.notnull(df), None)
     df_json = df_clean.to_json(orient='records')
 
-    # HTML Šablona
     html_content = f"""
     <!DOCTYPE html>
     <html lang="cs">
@@ -329,14 +353,13 @@ def log_interactive_dataframe_to_wandb(df: pd.DataFrame, table_name: str = "vali
     """
 
     log_payload = {table_name: wandb.Html(html_content)}
-
     if step is not None:
         wandb.log(log_payload, step=step)
     else:
         wandb.log(log_payload)
 
 
-# --- 5. Callback pro sběr dat a volání HTML generátoru ---
+# --- 5. Callback pro sběr dat ---
 class InteractiveReportCallback(Callback):
     def __init__(self, log_function):
         self.log_func = log_function
@@ -344,122 +367,128 @@ class InteractiveReportCallback(Callback):
         self.targets = []
 
     def eval_batch_end(self, state: State, logger: Logger):
-        # Sběr dat z aktuálního batche
-        # Přesuneme na CPU a převedeme na numpy
-        outputs = state.outputs.detach().cpu().numpy()
-        targets = state.batch['targets'].detach().cpu().numpy()
-
-        # V DDP režimu by správně měl sbírat data jen rank 0,
-        # nebo bychom museli dělat all_gather.
-        # Pro vizualizaci stačí, když rank 0 zaloguje "svou část" validace,
-        # nebo (pokud je validace malá) to necháme takto a rank 0 posbírá co vidí.
-        # Zde sbíráme lokálně na každém procesu, ale logovat budeme jen na ranku 0.
-        self.preds.extend(outputs)
-        self.targets.extend(targets)
+        if state.dataloader_label == "full_val":
+            outputs = state.outputs.detach().cpu().numpy()
+            targets = state.batch['targets'].detach().cpu().numpy()
+            self.preds.extend(outputs)
+            self.targets.extend(targets)
 
     def eval_end(self, state: State, logger: Logger):
-        # Logujeme pouze na hlavním procesu (Rank 0)
-        if dist.get_global_rank() == 0:
-            if len(self.preds) > 0:
-                df = pd.DataFrame({
-                    'predicted_fitness': self.preds,
-                    'actual_fitness': self.targets
-                })
+        if dist.get_global_rank() == 0 and len(self.preds) > 0:
+            df = pd.DataFrame({
+                'predicted_fitness': self.preds,
+                'actual_fitness': self.targets
+            })
 
-                # Název tabulky podle epochy
-                table_name = f"val_results_epoch_{int(state.timestamp.epoch)}"
+            table_name = f"val_results_epoch_{int(state.timestamp.epoch)}"
+            current_step = int(state.timestamp.batch)
 
-                try:
-                    self.log_func(df, table_name=table_name, step=int(state.timestamp.epoch))
-                    print(f"HTML Report '{table_name}' generated and logged.")
-                except Exception as e:
-                    print(f"Error generating HTML report: {e}")
+            try:
+                self.log_func(df, table_name=table_name, step=current_step)
+                print(f"HTML Report '{table_name}' generated at step {current_step}.")
+            except Exception as e:
+                print(f"Error generating HTML report: {e}")
 
-            # Vyčištění listů pro další epochu
-            self.preds = []
-            self.targets = []
+        self.preds = []
+        self.targets = []
 
 
 # --- 6. Hlavní funkce ---
 def train_full_model(train_df, validation_df, config):
     print(f"Train samples: {len(train_df)}, Validation samples: {len(validation_df)}")
 
-    # 1. Tokenizer & [SEP]
+    # 1. Tokenizer
     tokenizer = BertTokenizer.from_pretrained(config.pretrained_model, do_lower_case=False)
     if "[SEP]" not in tokenizer.get_vocab():
         tokenizer.add_tokens(["[SEP]"])
         print("INFO: Token [SEP] was added to tokenizer")
 
     # 2. Model
-    model = ComposerProteinModel(config.pretrained_model, tokenizer)
+    composer_model = ComposerProteinModel(config.pretrained_model, tokenizer)
+
+    # === Aplikace zmrazení vrstev (z původního skriptu) ===
+    freeze_depth = getattr(config, 'freeze_layers', 0)
+    freeze_bert_layers(composer_model.model, freeze_depth)
 
     # 3. DataLoaders
     train_dataset = ProteinMutationDataset(train_df, tokenizer, config.max_length)
+    train_sampler = dist.get_sampler(train_dataset, shuffle=True, drop_last=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size, sampler=train_sampler,
+                                  drop_last=True)
+
     val_dataset = ProteinMutationDataset(validation_df, tokenizer, config.max_length)
 
-    train_sampler = dist.get_sampler(train_dataset, shuffle=True, drop_last=True)
-    val_sampler = dist.get_sampler(val_dataset, shuffle=False, drop_last=False)
+    val_sampler_subset = dist.get_sampler(val_dataset, shuffle=True, drop_last=True)
+    val_loader_subset = DataLoader(val_dataset, batch_size=config.batch_size, sampler=val_sampler_subset,
+                                   drop_last=True)
 
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        sampler=train_sampler,
-        num_workers=4,
-        drop_last=True
+    val_sampler_full = dist.get_sampler(val_dataset, shuffle=False, drop_last=False)
+    val_loader_full = DataLoader(val_dataset, batch_size=config.batch_size, sampler=val_sampler_full,
+                                 drop_last=False)
+
+    # 4. Evaluators
+    eval_frequent = Evaluator(
+        label="frequent_val",
+        dataloader=val_loader_subset,
+        metric_names=['mse', 'pearson'],
+        subset_num_batches=20,
+        eval_interval="100ba"
     )
 
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        sampler=val_sampler,
-        num_workers=4,
-        drop_last=False
+    eval_full = Evaluator(
+        label="full_val",
+        dataloader=val_loader_full,
+        eval_interval="1ep"
     )
 
-    # 4. Optimizer
-    optimizer = DecoupledAdamW(model.parameters(), lr=config.learning_rate)
+    # 5. Optimizer & Scheduler
+    optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
+    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.3dur", alpha_f=0.10)
 
-    # 5. Callbacks
-    # Přidán náš nový callback
+    # 6. Callbacks
     html_callback = InteractiveReportCallback(log_interactive_dataframe_to_wandb)
 
-    scheduler = CosineAnnealingWithWarmupScheduler(
-        t_warmup="0.1dur",  # 10% Warmup
-        alpha_f=0.01  # Klesne na 1% původní LR
+    early_stopper = EarlyStopper(
+        monitor="mse",
+        dataloader_label="full_val",
+        patience=config.early_stopping_patience,
+        min_delta=config.early_stopping_delta
     )
 
-    callbacks = [
-        LRMonitor(),
-        OptimizerMonitor(),
-        html_callback
-    ]
+    callbacks = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper]
 
-    # 6. Trainer
+    # === NOVÉ: Inicializace Gradient Clipping Algoritmu ===
+    # Podle dokumentace: clipping_type='norm', threshold=1.0 (standard pro BERT)
+    gc = GradientClipping(clipping_type='norm', clipping_threshold=1.0)
+
+    save_path = os.path.join(config.base_dir, 'checkpoints')
+
+    # 7. Trainer
     trainer = Trainer(
-        model=model,
+        model=composer_model,
         train_dataloader=train_dataloader,
-        eval_dataloader=val_dataloader,
+        eval_dataloader=[eval_frequent, eval_full],
         max_duration=f"{config.epochs}ep",
         optimizers=optimizer,
         schedulers=scheduler,
-        parallelism_config={
-            'ddp': {
-                'find_unused_parameters': True
-            }
-        },
 
+        algorithms=[gc],
+        # ==============================================
+
+        # === Seed ===
+        seed=42,
+
+        save_folder=save_path,
+
+        parallelism_config={'ddp': {'find_unused_parameters': True}},
         callbacks=callbacks,
         loggers=[WandBLogger(project=config.project_name)],
-        eval_interval="1ep",
-
-        save_folder=getattr(config, 'save_folder', './checkpoints'),
         save_filename='model_epoch_{epoch}.pt',
         save_overwrite=True,
-
         device="gpu",
-        precision="amp_fp16"
+        # precision="amp_fp16"
     )
 
-    print("Starting training with CORRECT architecture & HTML Reports...")
+    print(f"Starting training (Freezing {freeze_depth} layers, Grad Clip 1.0, Seed 42)...")
     trainer.fit()
     print("Training finished successfully!")
