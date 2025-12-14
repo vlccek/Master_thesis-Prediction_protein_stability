@@ -3,3 +3,6 @@ __pycache__/
 .ipynb_checkpoints/
 *.ipynb
 wandb/
+*.html
+megascale*.csv
+lehner*.csv

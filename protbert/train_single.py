@@ -19,14 +19,31 @@ parser.add_argument("--smart_batch", type=bool, default=False,
 parser.add_argument("--project_name", type=str, default="protein-mutation-prediction-protbert",
                     help="WandB project name")
 
+parser.add_argument("--datasets_prefix", type=str, default="", )
+
 parser.add_argument("--base_dir", type=str, default="./", )
 
 parser.add_argument("--step_validation", type=int, default=1500)
 args = parser.parse_args()
 
+# check existence of csv files
+import os
+
+print(f"the datasets_base_dir {args.base_dir} and datasets_prefix {args.datasets_prefix}")
+
+TRAIN_PATH = f"{args.base_dir}/{args.datasets_prefix}train.csv"
+TEST_PATH = f"{args.base_dir}/{args.datasets_prefix}test.csv"
+
+# test if files exist
+if not os.path.exists(TRAIN_PATH):
+    raise FileNotFoundError(f"Train file not found: {TRAIN_PATH}")
+if not os.path.exists(TEST_PATH):
+    raise FileNotFoundError(f"Test file not found: {TEST_PATH}")
+
 # --- Load dataset ---
-df = pd.read_csv(f"{args.base_dir}/dataset_255w_train.csv")
-df_test = pd.read_csv(f"{args.base_dir}/dataset_255w_test.csv")
+df = pd.read_csv(TRAIN_PATH)
+df_test = pd.read_csv(TEST_PATH)
+
 
 if args.limit > 0:
     df = df[:args.limit]
