@@ -28,6 +28,7 @@ class Config:
     early_stopping_patience = 2
     early_stopping_delta = 0.001
     step_validation = 1500
+    base_dir = "./"
 
 
 # Custom Dataset with concatenated sequences
@@ -309,8 +310,8 @@ def train_single_model(train_df, testing_df, config):
     train_dataset = ProteinMutationDataset(train_df, tokenizer, config.max_length)
     testing_dataset = ProteinMutationDataset(testing_df, tokenizer, config.max_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True,     num_workers=4,
-    pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4,
+                              pin_memory=True)
     testing_loader = DataLoader(testing_dataset, batch_size=config.batch_size)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -523,7 +524,6 @@ def run_validation_worker(config, model, df):
         print(f"   🔴 Poor fit (R²={r2:.3f}) - model explains {r2 * 100:.1f}% of variance")
 
     print(f"--- [Async Val] Process finished. Results sent back. ---")
-
 
 
 def log_interactive_dataframe_to_wandb(
