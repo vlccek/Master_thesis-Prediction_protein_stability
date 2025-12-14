@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .idea/
 wandb/
+datasets/
+idea/
+.ipynb_checkpoints
