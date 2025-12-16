@@ -19,7 +19,7 @@ class Config:
     project_name = "protein-mutation-prediction-protbert"
     pretrained_model = "Rostlab/prot_bert"
     wandb_token = ""
-    max_length = 512
+    max_length = 1024
     batch_size = 48
     learning_rate = 5e-5
     hidden_dropout_prob = 0.1
