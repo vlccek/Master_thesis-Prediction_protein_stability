@@ -39,53 +39,79 @@ class Config:
     early_stopping_delta: float = 0.001
     step_validation: int = 1500
     base_dir: str = "./"
+    seq_window_size: int = 255
 
 
-def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024):
+def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_size: int = 255):
     """
-    Přijme DF, přidá sloupce 'clean_wt' a 'clean_mut' (ořezané),
-    ale ZACHOVÁ všechny původní sloupce pro HTML report.
+    Přijme DF, přidá sloupce 'clean_wt' a 'clean_mut' (ořezané).
+    Logika: Vytvoří okno o velikosti `window_size` kolem mutace.
     """
 
-    # Pomocná funkce pro mutaci
-    def find_mutation_idx_struct(struct):
-        s1, s2 = struct['wt'], struct['mut']
-        limit = min(len(s1), len(s2))
-        for i in range(limit):
+    # 1. Standardizace názvů sloupců
+    if "target" in df.columns and "fitness" not in df.columns:
+        df = df.rename({"target": "fitness"})
+    if "mutation" not in df.columns and "mut_type" in df.columns:
+        df = df.rename({"mut_type": "mutation"})
+
+    # 2. Priorita: Použít předvypočítané fragmenty (POUZE pokud sedí velikost okna)
+    # Předpokládáme, že sloupce 'fragment_255_org' odpovídají oknu 255.
+    if window_size == 255 and "fragment_255_org" in df.columns and "fragment_255_mut" in df.columns:
+        print("INFO: Using pre-calculated fragments (fragment_255_org/mut).")
+        df_processed = df.with_columns([
+            pl.col("fragment_255_org").str.replace_all("[UZOB]", "X").alias("clean_wt"),
+            pl.col("fragment_255_mut").str.replace_all("[UZOB]", "X").alias("clean_mut")
+        ])
+        return df_processed
+
+    # 3. Dynamický výpočet (pro homology dataset nebo jinou délku okna)
+    print(f"INFO: Calculating fragments dynamically (Window={window_size}).")
+    
+    # Sjednocení názvů vstupních sekvencí
+    if "original_seq_full" in df.columns:
+        df = df.rename({"original_seq_full": "wt_sequence", "mutated_seq_full": "mut_sequence"})
+    
+    if "wt_sequence" not in df.columns:
+        raise ValueError(f"Dataset missing 'wt_sequence'. Columns: {df.columns}")
+
+    # Funkce pro nalezení indexu mutace (prioritně z popisu 'mutation')
+    def get_mutation_idx(row):
+        import re
+        # Pokusíme se parsovat číslo z "A168V"
+        if row['mutation']:
+            match = re.search(r'\d+', str(row['mutation']))
+            if match:
+                return int(match.group(0)) - 1
+        
+        # Fallback: Porovnání sekvencí
+        s1, s2 = row['wt_sequence'], row['mut_sequence']
+        for i in range(min(len(s1), len(s2))):
             if s1[i] != s2[i]:
                 return i
         return 0
 
-    half_window = (max_total_length - 3) // 2
+    target_window_size = window_size
+    half_window = target_window_size // 2
 
-    # Aplikace logiky (předpokládám názvy z tvého CSV: wt_sequence, mut_sequence)
     df_processed = df.with_columns([
-        pl.struct([pl.col("wt_sequence").alias("wt"), pl.col("mut_sequence").alias("mut")])
-        .map_elements(find_mutation_idx_struct, return_dtype=pl.Int64)
+        pl.struct(["wt_sequence", "mut_sequence", "mutation"])
+        .map_elements(get_mutation_idx, return_dtype=pl.Int64)
         .alias("mut_idx"),
-
         pl.col("wt_sequence").str.len_chars().alias("seq_len")
     ]).with_columns([
-        (pl.col("mut_idx") - (half_window // 2)).clip(lower_bound=0).alias("start_idx")
+        (pl.col("mut_idx") - half_window).clip(lower_bound=0).alias("start_idx")
     ]).with_columns([
-        pl.when((pl.col("start_idx") + half_window) > pl.col("seq_len"))
-        .then((pl.col("seq_len") - half_window).clip(lower_bound=0))
+        pl.when((pl.col("start_idx") + target_window_size) > pl.col("seq_len"))
+        .then((pl.col("seq_len") - target_window_size).clip(lower_bound=0))
         .otherwise(pl.col("start_idx"))
         .alias("final_start")
     ]).with_columns([
-        # Vytvoříme NOVÉ sloupce, staré necháme
-        pl.col("wt_sequence")
-        .str.slice(pl.col("final_start"), half_window)
-        .str.replace_all("[UZOB]", "X")
-        .alias("clean_wt"),  # Toto půjde do modelu
-
-        pl.col("mut_sequence")
-        .str.slice(pl.col("final_start"), half_window)
-        .str.replace_all("[UZOB]", "X")
-        .alias("clean_mut")  # Toto půjde do modelu
+        pl.col("wt_sequence").str.slice(pl.col("final_start"), target_window_size)
+        .str.replace_all("[UZOB]", "X").alias("clean_wt"),
+        pl.col("mut_sequence").str.slice(pl.col("final_start"), target_window_size)
+        .str.replace_all("[UZOB]", "X").alias("clean_mut")
     ])
 
-    # VRACÍME VŠE (nefiltrujeme sloupce)
     return df_processed
 
 
@@ -125,9 +151,9 @@ class ProteinMutationDataset(Dataset):
         inputs = self.tokenizer(
             seq_wt,
             seq_mut,
-            truncation=True,  # Pro jistotu, kdyby příprava selhala o pár znaků
+            truncation=True,
             max_length=self.max_length,
-            padding=False,  # DŮLEŽITÉ: Necháme padding na DataCollator
+            padding='max_length',  # Změna: Statický padding jako v Model.py
             return_token_type_ids=True
         )
 
@@ -137,9 +163,7 @@ class ProteinMutationDataset(Dataset):
             'token_type_ids': torch.tensor(inputs['token_type_ids'], dtype=torch.long),
             'labels': torch.tensor(target, dtype=torch.float),
             'row_idx': torch.tensor(row_id, dtype=torch.long)
-
         }
-
 
 # --- 2. Model (Correct Architecture) ---
 class ProteinMutationModel(nn.Module):
@@ -151,8 +175,11 @@ class ProteinMutationModel(nn.Module):
         if len(tokenizer) > self.bert.config.vocab_size:
             self.bert.resize_token_embeddings(len(tokenizer))
 
+        # hidden_size * 2 (Jen WT a MUT, bez CLS, přesně jako v Model.py)
+        input_dim = self.bert.config.hidden_size * 2
+
         self.regressor_head = nn.Sequential(
-            nn.Linear(self.bert.config.hidden_size * 3, 1024),
+            nn.Linear(input_dim, 1024),
             nn.BatchNorm1d(1024),
             nn.GELU(),
             nn.Dropout(0.25),
@@ -167,21 +194,7 @@ class ProteinMutationModel(nn.Module):
             nn.Linear(256, 1)
         )
 
-        self.final_activation = nn.Tanh()
-
     def forward(self, input_ids, attention_mask, token_type_ids=None):
-        # 1. Pokud token_type_ids nejsou dodány (některé tokenizery to nedělají automaticky),
-        #    vytvoříme je. Ale většinou tam budou.
-        if token_type_ids is None:
-            # Fallback logika, pokud by chyběly (méně efektivní, ale funkční)
-            sep_token_id = self.tokenizer.sep_token_id
-            sep_mask = (input_ids == sep_token_id)
-            sep_idx = torch.argmax(sep_mask.float(), dim=1)
-            seq_len = input_ids.size(1)
-            arange = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-            token_type_ids = (arange > sep_idx.unsqueeze(1)).long()
-
-        # 2. Průchod modelem
         outputs = self.bert(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -189,43 +202,26 @@ class ProteinMutationModel(nn.Module):
         )
         sequence_output = outputs.last_hidden_state
 
-        # 3. Vytvoření masek pro WT (typ 0) a MUT (typ 1)
-        # Chceme ignorovat [CLS], [SEP] a [PAD]
+        sep_token_id = self.tokenizer.sep_token_id
+        sep_mask = (input_ids == sep_token_id)
+        sep_indices = torch.argmax(sep_mask.float(), dim=1)
 
-        # Maska pro speciální tokeny (chceme ignorovat SEP a CLS ve výpočtu průměru)
-        special_tokens_mask = (input_ids == self.tokenizer.sep_token_id) | \
-                              (input_ids == self.tokenizer.cls_token_id)
+        arange_mask = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
 
-        # Maska pro WT: Je typu 0, je v attention masce (není padding) a není speciální token
-        wt_mask = (token_type_ids == 0) & attention_mask.bool() & (~special_tokens_mask)
+        wt_mask = (arange_mask > 0) & (arange_mask < sep_indices.unsqueeze(1)) & attention_mask.bool()
+        mut_mask = (arange_mask > sep_indices.unsqueeze(1)) & attention_mask.bool()
 
-        # Maska pro MUT: Je typu 1, je v attention masce a není speciální token
-        mut_mask = (token_type_ids == 1) & attention_mask.bool() & (~special_tokens_mask)
+        wt_sum = (sequence_output * wt_mask.unsqueeze(-1).float()).sum(dim=1)
+        mut_sum = (sequence_output * mut_mask.unsqueeze(-1).float()).sum(dim=1)
 
-        # 4. Mean Pooling (bezpečný)
-        # Rozšíření masek pro násobení s embeddingy
-        wt_mask_expanded = wt_mask.unsqueeze(-1).float()
-        mut_mask_expanded = mut_mask.unsqueeze(-1).float()
+        wt_count = wt_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
+        mut_count = mut_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
 
-        # Součty
-        wt_sum = (sequence_output * wt_mask_expanded).sum(dim=1)
-        mut_sum = (sequence_output * mut_mask_expanded).sum(dim=1)
-
-        # Počty (clamp kvůli dělení nulou)
-        wt_count = wt_mask_expanded.sum(dim=1).clamp(min=1e-9)
-        mut_count = mut_mask_expanded.sum(dim=1).clamp(min=1e-9)
-
-        # Průměry
         wt_repr = wt_sum / wt_count
         mut_repr = mut_sum / mut_count
 
-        cls_repr = sequence_output[:, 0, :]
-
-        # 5. Spojení a predikce
-        combined_embeddings = torch.cat([cls_repr, wt_repr, mut_repr], dim=1)
-        logits = self.regressor_head(combined_embeddings)
-
-        return self.final_activation(logits)
+        combined_embeddings = torch.cat([wt_repr, mut_repr], dim=1)
+        return self.regressor_head(combined_embeddings)
 
 
 # --- 3. Composer Wrapper ---
@@ -236,6 +232,8 @@ class ComposerProteinModel(ComposerModel):
         self.classification_threshold = 0.0
 
         self.model = ProteinMutationModel(pretrained_model_name, tokenizer)
+
+        self.criterion = nn.MSELoss()
 
         self.val_metrics = nn.ModuleDict({
             'mse': MeanSquaredError(),
@@ -251,12 +249,13 @@ class ComposerProteinModel(ComposerModel):
     def forward(self, batch):
         return self.model(
             input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
+            attention_mask=batch['attention_mask'],
+            token_type_ids=batch.get('token_type_ids')
         )
 
     def loss(self, outputs, batch):
         # Squeeze je důležitý pro srovnání rozměrů [B, 1] vs [B]
-        return F.mse_loss(outputs.squeeze(), batch["labels"])
+        return self.criterion(outputs.squeeze(), batch["labels"])
 
     def get_metrics(self, is_train: bool = False):
         if is_train:
@@ -629,15 +628,20 @@ class InteractiveReportCallback(Callback):
 def train_full_model(train_df_raw, val_df_raw, config):
     print(f"Train samples: {len(train_df_raw)}, Validation samples: {len(val_df_raw)}")
 
-    print(f"The config: {json.dumps(asdict(config))}")
+    config_dict = asdict(config)
+
+    if "wandb_token" in config_dict:
+        del config_dict["wandb_token"]
+
+    print(f"The config: {json.dumps(config_dict)}")
     # 1. Tokenizer
     tokenizer = BertTokenizer.from_pretrained(config.pretrained_model, do_lower_case=False)
 
-    print("Preprocessing Training Data...")
-    train_df = prepare_data_dynamic(train_df_raw, max_total_length=config.max_length)
+    print(f"Preprocessing Training Data (Window Size: {config.seq_window_size})...")
+    train_df = prepare_data_dynamic(train_df_raw, max_total_length=config.max_length, window_size=config.seq_window_size)
 
-    print("Preprocessing Validation Data...")
-    validation_df = prepare_data_dynamic(val_df_raw, max_total_length=config.max_length)
+    print(f"Preprocessing Validation Data (Window Size: {config.seq_window_size})...")
+    validation_df = prepare_data_dynamic(val_df_raw, max_total_length=config.max_length, window_size=config.seq_window_size)
 
     if isinstance(validation_df, pd.DataFrame):
         validation_df = pl.from_pandas(validation_df)
@@ -645,7 +649,7 @@ def train_full_model(train_df_raw, val_df_raw, config):
     # 2. Model
     composer_model = ComposerProteinModel(config.pretrained_model, tokenizer)
 
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    # data_collator = DataCollatorWithPadding(tokenizer=tokenizer) # Odstraněno pro shodu s Model.py
 
     # === Aplikace zmrazení vrstev (z původního skriptu) ===
     freeze_depth = getattr(config, 'freeze_layers', 0)
@@ -658,8 +662,9 @@ def train_full_model(train_df_raw, val_df_raw, config):
                                   batch_size=config.batch_size,
                                   sampler=train_sampler,
                                   drop_last=True,
-                                  collate_fn=data_collator,
-                                  pin_memory=True)
+                                  # collate_fn=data_collator, # Odstraněno
+                                  pin_memory=True,
+                                  num_workers=8)
 
     val_dataset = ProteinMutationDataset(validation_df, tokenizer, config.max_length)
 
@@ -668,16 +673,18 @@ def train_full_model(train_df_raw, val_df_raw, config):
                                    batch_size=config.batch_size,
                                    sampler=val_sampler_subset,
                                    drop_last=True,
-                                   collate_fn=data_collator,
-                                   pin_memory=True)
+                                   # collate_fn=data_collator, # Odstraněno
+                                   pin_memory=True,
+                                   num_workers=8)
 
     val_sampler_full = dist.get_sampler(val_dataset, shuffle=False, drop_last=False)
     val_loader_full = DataLoader(val_dataset,
                                  batch_size=config.batch_size,
                                  sampler=val_sampler_full,
                                  drop_last=False,
-                                 collate_fn=data_collator,
-                                 pin_memory=True)
+                                 # collate_fn=data_collator, # Odstraněno
+                                 pin_memory=True,
+                                 num_workers=8)
 
     # 4. Evaluators
     eval_frequent = Evaluator(
@@ -685,7 +692,7 @@ def train_full_model(train_df_raw, val_df_raw, config):
         dataloader=val_loader_subset,
         metric_names=['mse', 'pearson'],
         subset_num_batches=20,
-        eval_interval="100ba"
+        eval_interval="500ba"
     )
 
     eval_full = Evaluator(
@@ -696,7 +703,7 @@ def train_full_model(train_df_raw, val_df_raw, config):
 
     # 5. Optimizer & Scheduler
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
-    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.3dur", alpha_f=0.10)
+    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.05dur", alpha_f=0.10)
 
     # 6. Callbacks
     html_callback = InteractiveReportCallback(
@@ -736,7 +743,7 @@ def train_full_model(train_df_raw, val_df_raw, config):
 
         parallelism_config={'ddp': {'find_unused_parameters': True}},
         callbacks=callbacks,
-        loggers=[WandBLogger(project=config.project_name)],
+        loggers=[WandBLogger(project=config.project_name, init_kwargs={"config": config_dict})],
         save_filename='model_epoch_homology_{epoch}.pt',
         save_overwrite=True,
         device="gpu",

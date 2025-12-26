@@ -24,6 +24,8 @@ parser.add_argument("--datasets_prefix", type=str, default="dataset_255w_")
 parser.add_argument("--base_dir", type=str, default="./", )
 parser.add_argument("--step_validation", type=int, default=1500)
 parser.add_argument("--model_name", type=str, default="Rostlab/prot_bert")
+parser.add_argument("--seq_window_size", type=int, default=255,
+                    help="Size of the sequence window centered around mutation (default: 255)")
 
 
 args = parser.parse_args()
@@ -60,7 +62,8 @@ config.batch_size = args.batch_size
 config.eval_interval = args.step_validation
 config.save_folder = "protbert_composer_checkpoints"
 config.base_dir = args.base_dir
-config.model_name = args.model_name
+config.pretrained_model = args.model_name
+config.seq_window_size = args.seq_window_size
 
 
 print(f"Training with config just started :happy:")

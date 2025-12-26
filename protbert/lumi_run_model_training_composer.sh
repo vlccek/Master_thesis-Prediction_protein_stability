@@ -21,8 +21,6 @@ export CONTAINER=${PROJECT_DIR}/rocm-protbert-wand-composer-rocm7.1.1.sif
 echo "Spouštím trénink na uzlu: $(hostname)"
 echo "Dostupná GPU zařízení: $CUDA_VISIBLE_DEVICES"
 
-# Vlastní spuštění skriptu
-# DŮLEŽITÉ: Zde musí být --rocm, aby kontejner viděl GPU
 
 srun singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
     --env WANDB_DIR=${WANDB_DIR} \
@@ -42,10 +40,11 @@ srun singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
     --env WANDB_DIR=${WANDB_DIR} \
     $CONTAINER \
     composer ${MNT_DIR_CONTAINER}/train_composer.py \
-    --epochs 10 \
-    --batch_size 56 \
+    --epochs 5 \
+    --batch_size 40 \
     --base_dir=/mnt/data/datasets/ \
     --datasets_prefix="dataset_homology_split_" \
     --project_name="protein-mutation-prediction-protbert-composer"  \
     --model_name="Rostlab/prot_bert_bfd" \
+    --seq_window_size 255
 
