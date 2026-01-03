@@ -1,10 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=protbert_train_composer
 #SBATCH --account=project_465002373
-#SBATCH --partition=small-g       # Partition name
+#SBATCH --partition=standard-g      # Partition name
 #SBATCH --gpus-per-node=8
 #SBATCH --time=24:15:00       # Časový limit
-#SBATCH --mem=256G
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -13,16 +12,31 @@ export PROJECT_DIR=/flash/project_465002373/protbert
 export MNT_DIR_CONTAINER=/mnt/data
 export WANDB_DIR=${MNT_DIR_CONTAINER}/wandb
 
-export CONTAINER=${PROJECT_DIR}/rocm-protbert-wand-composer-rocm7.1.1.sif
+# --- Training Configuration ---
+export EPOCHS=10
+export BATCH_SIZE=46
+export BASE_DIR="/mnt/data/datasets/"
+# export DATASETS_PREFIX="dataset_split_"
+export DATASETS_PREFIX="dataset_homology_split_"
+export PROJECT_NAME="protein-mutation-prediction-protbert-composer"
+export MODEL_NAME="Rostlab/prot_bert_bfd"
+export SEQ_WINDOW_SIZE=255
+export FREEZED_LAYERS=3
 
-# Zavedení singularity modulu (pokud je na clusteru potřeba)
-# module load singularity
+export CPU_BIND_MASKS="0x00fe000000000000,0xfe00000000000000,0x0000000000fe0000,0x00000000fe000000,0x00000000000000fe,0x000000000000fe00,0x000000fe00000000,0x0000fe0000000000"
+
+# Tell RCCL to use Slingshot interfaces and GPU RDMA
+export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
+export NCCL_NET_GDR_LEVEL=PHB
+# ------------------------------
+
+export CONTAINER=${PROJECT_DIR}/rocm-protbert-wand-composer-rocm7.1.1.sif
 
 echo "Spouštím trénink na uzlu: $(hostname)"
 echo "Dostupná GPU zařízení: $CUDA_VISIBLE_DEVICES"
 
 
-srun singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
+srun --cpu-bind=v,mask_cpu:$CPU_BIND_MASKS singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
     --env WANDB_DIR=${WANDB_DIR} \
     $CONTAINER \
     bash -c "echo '--- SYSTEM INFO ---'; \
@@ -36,15 +50,16 @@ srun singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
              print(f'Device count: {torch.cuda.device_count()}'); \
              print(f'Current device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}')\""
 
-srun singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
+srun --cpu-bind=v,mask_cpu:$CPU_BIND_MASKS singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
     --env WANDB_DIR=${WANDB_DIR} \
     $CONTAINER \
     composer ${MNT_DIR_CONTAINER}/train_composer.py \
-    --epochs 5 \
-    --batch_size 40 \
-    --base_dir=/mnt/data/datasets/ \
-    --datasets_prefix="dataset_homology_split_" \
-    --project_name="protein-mutation-prediction-protbert-composer"  \
-    --model_name="Rostlab/prot_bert_bfd" \
-    --seq_window_size 255
+    --epochs ${EPOCHS} \
+    --batch_size ${BATCH_SIZE} \
+    --base_dir="${BASE_DIR}" \
+    --datasets_prefix="${DATASETS_PREFIX}" \
+    --project_name="${PROJECT_NAME}"  \
+    --model_name="${MODEL_NAME}" \
+    --seq_window_size ${SEQ_WINDOW_SIZE} \
+    --freezed_layers ${FREEZED_LAYERS}
 

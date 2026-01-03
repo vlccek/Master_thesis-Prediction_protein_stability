@@ -26,7 +26,10 @@ parser.add_argument("--step_validation", type=int, default=1500)
 parser.add_argument("--model_name", type=str, default="Rostlab/prot_bert")
 parser.add_argument("--seq_window_size", type=int, default=255,
                     help="Size of the sequence window centered around mutation (default: 255)")
-
+parser.add_argument("--freezed_layers", type=int, default=3, )
+parser.add_argument("--num_workers", type=int, default=2,
+                    help="Number of data loader workers (default: 2)")
+parser.add_argument("--save_folder", type=str, default="protbert_composer_checkpoints", )
 
 args = parser.parse_args()
 
@@ -60,12 +63,12 @@ config.project_name = args.project_name
 config.step_validation = args.step_validation
 config.batch_size = args.batch_size
 config.eval_interval = args.step_validation
-config.save_folder = "protbert_composer_checkpoints"
+config.save_folder = args.save_folder
 config.base_dir = args.base_dir
 config.pretrained_model = args.model_name
 config.seq_window_size = args.seq_window_size
-
+config.freeze_layers = args.freezed_layers
 
 print(f"Training with config just started :happy:")
 
-train_model(df, df_test, config)
+train_model(df, df_test, config, num_workers=args.num_workers)

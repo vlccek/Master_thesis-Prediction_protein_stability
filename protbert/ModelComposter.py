@@ -34,7 +34,7 @@ class Config:
     learning_rate: float = 5e-5
     hidden_dropout_prob: float = 0.1
     epochs: float = 15
-    freeze_layers: int = 2
+    freeze_layers: int = 3
     early_stopping_patience: int = 2
     early_stopping_delta: float = 0.001
     step_validation: int = 1500
@@ -233,7 +233,8 @@ class ComposerProteinModel(ComposerModel):
 
         self.model = ProteinMutationModel(pretrained_model_name, tokenizer)
 
-        self.criterion = nn.MSELoss()
+        # Používáme HuberLoss místo MSELoss - je méně citlivá na odlehlé hodnoty (šum v datech)
+        self.criterion = nn.HuberLoss(delta=1.0)
 
         self.val_metrics = nn.ModuleDict({
             'mse': MeanSquaredError(),
@@ -625,7 +626,7 @@ class InteractiveReportCallback(Callback):
 
 
 # --- 6. Hlavní funkce ---
-def train_full_model(train_df_raw, val_df_raw, config):
+def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
     print(f"Train samples: {len(train_df_raw)}, Validation samples: {len(val_df_raw)}")
 
     config_dict = asdict(config)
@@ -664,7 +665,7 @@ def train_full_model(train_df_raw, val_df_raw, config):
                                   drop_last=True,
                                   # collate_fn=data_collator, # Odstraněno
                                   pin_memory=True,
-                                  num_workers=8)
+                                  num_workers=num_workers)
 
     val_dataset = ProteinMutationDataset(validation_df, tokenizer, config.max_length)
 
@@ -675,7 +676,7 @@ def train_full_model(train_df_raw, val_df_raw, config):
                                    drop_last=True,
                                    # collate_fn=data_collator, # Odstraněno
                                    pin_memory=True,
-                                   num_workers=8)
+                                   num_workers=num_workers)
 
     val_sampler_full = dist.get_sampler(val_dataset, shuffle=False, drop_last=False)
     val_loader_full = DataLoader(val_dataset,
@@ -684,7 +685,7 @@ def train_full_model(train_df_raw, val_df_raw, config):
                                  drop_last=False,
                                  # collate_fn=data_collator, # Odstraněno
                                  pin_memory=True,
-                                 num_workers=8)
+                                 num_workers=num_workers)
 
     # 4. Evaluators
     eval_frequent = Evaluator(
@@ -703,7 +704,8 @@ def train_full_model(train_df_raw, val_df_raw, config):
 
     # 5. Optimizer & Scheduler
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
-    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.05dur", alpha_f=0.10)
+    # Změna: Ještě delší warmup (20%) - model se déle učí s rostoucím LR, což oddálí stagnaci
+    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.20dur", alpha_f=0.01)
 
     # 6. Callbacks
     html_callback = InteractiveReportCallback(
@@ -744,8 +746,12 @@ def train_full_model(train_df_raw, val_df_raw, config):
         parallelism_config={'ddp': {'find_unused_parameters': True}},
         callbacks=callbacks,
         loggers=[WandBLogger(project=config.project_name, init_kwargs={"config": config_dict})],
+
         save_filename='model_epoch_homology_{epoch}.pt',
+        save_latest_filename="latest",
         save_overwrite=True,
+        save_interval="1ep",
+
         device="gpu",
         precision="amp_bf16"
     )
