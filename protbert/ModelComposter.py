@@ -10,7 +10,7 @@ import torch.nn.functional as F
 # Composer imports
 from composer import Trainer, Callback, State, Logger, Evaluator
 from composer.algorithms import GradientClipping
-from composer.callbacks import EarlyStopper, LRMonitor, OptimizerMonitor
+from composer.callbacks import EarlyStopper, LRMonitor, OptimizerMonitor, CheckpointSaver
 from composer.loggers import WandBLogger
 from composer.models import ComposerModel
 from composer.optim import DecoupledAdamW
@@ -40,6 +40,7 @@ class Config:
     step_validation: int = 1500
     base_dir: str = "./"
     seq_window_size: int = 255
+    save_folder: str = "checkpoints"
 
 
 def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_size: int = 255):
@@ -720,11 +721,26 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
         min_delta=config.early_stopping_delta
     )
 
-    callbacks = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper]
+    save_path = os.path.join(config.base_dir, config.save_folder)
+    checkpoint_saver = CheckpointSaver(
+        folder=save_path,
+        filename="best_model.pt",
+        save_interval="1ep",
+        save_best_metric="metrics/full_val/mse",
+        higher_is_better=False,
+        overwrite=True
+    )
+
+    callbacks = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper, checkpoint_saver]
 
     gc = GradientClipping(clipping_type='norm', clipping_threshold=1.0)
 
-    save_path = os.path.join(config.base_dir, 'checkpoints')
+    wandb_logger = WandBLogger(
+        project=config.project_name,
+        init_kwargs={"config": config_dict},
+        log_artifacts=True,
+        rank_zero_only=True
+    )
 
     # 7. Trainer
     trainer = Trainer(
@@ -741,17 +757,9 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
         # === Seed ===
         seed=42,
 
-        save_folder=save_path,
-
         parallelism_config={'ddp': {'find_unused_parameters': True}},
         callbacks=callbacks,
-        loggers=[WandBLogger(project=config.project_name, init_kwargs={"config": config_dict})],
-
-        save_filename='model_epoch_homology_{epoch}.pt',
-        save_latest_filename="latest",
-        save_overwrite=True,
-        save_interval="1ep",
-
+        loggers=[wandb_logger],
         device="gpu",
         precision="amp_bf16"
     )
