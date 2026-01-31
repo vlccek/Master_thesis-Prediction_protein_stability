@@ -13,7 +13,11 @@ parser.add_argument("--limit", type=int, default=0,
 parser.add_argument("--lr", type=float, default=1e-6,
                     help="Learning rate")
 parser.add_argument("--epochs", type=int, default=3,
-                    help="Number of training epochs")
+                    help="Number of training epochs (Depreceated in favor of epochs_full)")
+parser.add_argument("--epochs_full", type=int, default=5,
+                    help="Number of training epochs on full dataset")
+parser.add_argument("--epochs_extreme", type=int, default=2,
+                    help="Number of training epochs on extreme subset")
 parser.add_argument("--batch_size", type=int, default=46,
                     help="Batch size")
 parser.add_argument("--smart_batch", type=bool, default=False,
@@ -55,7 +59,7 @@ if args.limit > 0:
 
 # --- Config setup ---
 config = Config()
-config.epochs = args.epochs
+config.epochs = args.epochs # Keep for compatibility/logging, but train_model uses explicit args
 config.batch_size = args.batch_size
 config.wandb_token = "c72619d4978c2953476cc5cf60d9ac0fac32b809"
 config.learning_rate = args.lr
@@ -71,4 +75,4 @@ config.freeze_layers = args.freezed_layers
 
 print(f"Training with config just started :happy:")
 
-train_model(df, df_test, config, num_workers=args.num_workers)
+train_model(df, df_test, config, num_workers=args.num_workers, epochs_full=args.epochs_full, epochs_extreme=args.epochs_extreme)

@@ -67,11 +67,11 @@ def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_
 
     # 3. Dynamický výpočet (pro homology dataset nebo jinou délku okna)
     print(f"INFO: Calculating fragments dynamically (Window={window_size}).")
-    
+
     # Sjednocení názvů vstupních sekvencí
     if "original_seq_full" in df.columns:
         df = df.rename({"original_seq_full": "wt_sequence", "mutated_seq_full": "mut_sequence"})
-    
+
     if "wt_sequence" not in df.columns:
         raise ValueError(f"Dataset missing 'wt_sequence'. Columns: {df.columns}")
 
@@ -83,7 +83,7 @@ def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_
             match = re.search(r'\d+', str(row['mutation']))
             if match:
                 return int(match.group(0)) - 1
-        
+
         # Fallback: Porovnání sekvencí
         s1, s2 = row['wt_sequence'], row['mut_sequence']
         for i in range(min(len(s1), len(s2))):
@@ -166,6 +166,7 @@ class ProteinMutationDataset(Dataset):
             'row_idx': torch.tensor(row_id, dtype=torch.long)
         }
 
+
 # --- 2. Model (Correct Architecture) ---
 class ProteinMutationModel(nn.Module):
     def __init__(self, pretrained_model_name, tokenizer):
@@ -207,7 +208,8 @@ class ProteinMutationModel(nn.Module):
         sep_mask = (input_ids == sep_token_id)
         sep_indices = torch.argmax(sep_mask.float(), dim=1)
 
-        arange_mask = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
+        arange_mask = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0),
+                                                                                                   -1)
 
         wt_mask = (arange_mask > 0) & (arange_mask < sep_indices.unsqueeze(1)) & attention_mask.bool()
         mut_mask = (arange_mask > sep_indices.unsqueeze(1)) & attention_mask.bool()
@@ -334,7 +336,7 @@ def log_interactive_report_polars(df: pl.DataFrame, table_name: str, step: int =
         "cath_class", "cath_arch", "cath_topology", "cath_homology", "data_source",
         "predicted_fitness", "actual_fitness"
     ]).with_columns(
-        (pl.col("predicted_fitness") - pl.col("actual_fitness")).alias("diff")
+        (pl.col("predicted_fitness") - pl.col("actual_fitness")).abs().alias("diff")
     )
 
     json_data = df_export.write_json()
@@ -627,7 +629,7 @@ class InteractiveReportCallback(Callback):
 
 
 # --- 6. Hlavní funkce ---
-def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
+def train_full_model(train_df_raw, val_df_raw, config, num_workers=8, epochs_full=5, epochs_extreme=2):
     print(f"Train samples: {len(train_df_raw)}, Validation samples: {len(val_df_raw)}")
 
     config_dict = asdict(config)
@@ -640,10 +642,12 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
     tokenizer = BertTokenizer.from_pretrained(config.pretrained_model, do_lower_case=False)
 
     print(f"Preprocessing Training Data (Window Size: {config.seq_window_size})...")
-    train_df = prepare_data_dynamic(train_df_raw, max_total_length=config.max_length, window_size=config.seq_window_size)
+    train_df = prepare_data_dynamic(train_df_raw, max_total_length=config.max_length,
+                                    window_size=config.seq_window_size)
 
     print(f"Preprocessing Validation Data (Window Size: {config.seq_window_size})...")
-    validation_df = prepare_data_dynamic(val_df_raw, max_total_length=config.max_length, window_size=config.seq_window_size)
+    validation_df = prepare_data_dynamic(val_df_raw, max_total_length=config.max_length,
+                                         window_size=config.seq_window_size)
 
     if isinstance(validation_df, pd.DataFrame):
         validation_df = pl.from_pandas(validation_df)
@@ -683,7 +687,7 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
     val_loader_full = DataLoader(val_dataset,
                                  batch_size=config.batch_size,
                                  sampler=val_sampler_full,
-                                 drop_last=False,
+                                 drop_last=True,
                                  # collate_fn=data_collator, # Odstraněno
                                  pin_memory=True,
                                  num_workers=num_workers)
@@ -724,10 +728,8 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
     save_path = os.path.join(config.base_dir, config.save_folder)
     checkpoint_saver = CheckpointSaver(
         folder=save_path,
-        filename="best_model.pt",
+        filename="best_model_full.pt",
         save_interval="1ep",
-        save_best_metric="metrics/full_val/mse",
-        higher_is_better=False,
         overwrite=True
     )
 
@@ -742,12 +744,13 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
         rank_zero_only=True
     )
 
-    # 7. Trainer
+    # 7. Trainer (PHASE 1 - FULL DATASET)
+    print(f"=== Starting PHASE 1: Full Dataset Training ({epochs_full} epochs) ===")
     trainer = Trainer(
         model=composer_model,
         train_dataloader=train_dataloader,
         eval_dataloader=[eval_frequent, eval_full],
-        max_duration=f"{config.epochs}ep",
+        max_duration=f"{epochs_full}ep",
         optimizers=optimizer,
         schedulers=scheduler,
 
@@ -764,6 +767,75 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8):
         precision="amp_bf16"
     )
 
-    print(f"Starting training (Freezing {freeze_depth} layers, Grad Clip 1.0, Seed 42)...")
     trainer.fit()
+    print("=== PHASE 1 Finished ===")
+
+    trainer.close()
+
+    # 8. Trainer (PHASE 2 - EXTREME SUBSET)
+    # Filtrování datasetu pro extrémní hodnoty (fitness > 0.3)
+    print("Filtering dataset for Phase 2 (Extreme Values: abs(fitness) > 0.3)...")
+
+    # Předpokládáme, že 'fitness' je název sloupce s targetem (prepare_data_dynamic ho přejmenovává)
+    if "fitness" in train_df.columns:
+        train_df_extreme = train_df.filter(pl.col("fitness").abs() > 0.3)
+    else:
+        print("WARNING: 'fitness' column not found, skipping Phase 2.")
+        train_df_extreme = pl.DataFrame()
+
+    print(f"Phase 2 Dataset size: {len(train_df_extreme)} samples.")
+
+    if epochs_extreme > 0:
+        print(f"=== Starting PHASE 2: Extreme Subset Training ({epochs_extreme} epochs) ===")
+
+        # Nový DataLoader pro extrémní data
+        train_dataset_extreme = ProteinMutationDataset(train_df_extreme, tokenizer, config.max_length)
+        train_sampler_extreme = dist.get_sampler(train_dataset_extreme, shuffle=True, drop_last=True)
+        train_dataloader_extreme = DataLoader(
+            train_dataset_extreme,
+            batch_size=config.batch_size,
+            sampler=train_sampler_extreme,
+            drop_last=True,
+            pin_memory=True,
+            num_workers=num_workers
+        )
+
+        # Pro druhou fázi vytvoříme nový Optimizer a Scheduler (fine-tuning)
+        optimizer_extreme = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
+        scheduler_extreme = CosineAnnealingWithWarmupScheduler(t_warmup="0.20dur", alpha_f=0.01)
+
+        # Checkpoint pro extreme phase (aby nepřepsal ten hlavní, pokud nechceme)
+        # Uložíme jako 'best_model_extreme.pt'
+        checkpoint_saver_extreme = CheckpointSaver(
+            folder=save_path,
+            filename="best_model_extreme.pt",
+            save_interval="1ep",
+            overwrite=True
+        )
+
+        callbacks_extreme = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper, checkpoint_saver_extreme]
+
+        # Nový Trainer instance
+        # Pozor: Používáme STEJNÝ composer_model (má už naučené váhy z Fáze 1)
+        trainer_extreme = Trainer(
+            model=composer_model,
+            train_dataloader=train_dataloader_extreme,
+            eval_dataloader=[eval_frequent, eval_full],
+            max_duration=f"{epochs_extreme}ep",
+            optimizers=optimizer_extreme,
+            schedulers=scheduler_extreme,
+            algorithms=[gc],
+            seed=42,
+            parallelism_config={'ddp': {'find_unused_parameters': True}},
+            callbacks=callbacks_extreme,
+            loggers=[wandb_logger],  # Logujeme do stejného W&B runu
+            device="gpu",
+            precision="amp_bf16"
+        )
+
+        trainer_extreme.fit()
+        print("=== PHASE 2 Finished ===")
+    else:
+        print("Skipping Phase 2 (Dataset too small or epochs set to 0).")
+
     print("Training finished successfully!")
