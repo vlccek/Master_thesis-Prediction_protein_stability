@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css" />
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-alpine-dark.css" />
+        <style>
+            body { font-family: 'Segoe UI', sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px; }
+            .container { max-width: 100%; margin: 0 auto; }
+
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+            h2 { margin: 0; color: #fff; }
+
+            .controls-panel { background-color: #1e1e1e; padding: 15px; margin-bottom: 20px; border-radius: 8px; display: flex; gap: 20px; align-items: center; border: 1px solid #333; }
+
+            .input-group { display: flex; align-items: center; gap: 10px; }
+            input[type=number] { background: #333; color: white; border: 1px solid #555; padding: 5px; border-radius: 4px; width: 70px; }
+
+            .btn { padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s; color: white; }
+            .btn-recalc { background-color: #2196F3; }
+            .btn-recalc:hover { background-color: #1976D2; }
+            .btn-download { background-color: #4CAF50; }
+            .btn-download:hover { background-color: #388E3C; }
+
+            .metric-container { display: flex; gap: 15px; flex-wrap: wrap; justify-content: space-between; width: 100%; }
+            .metric-card { background-color: #252525; padding: 10px 15px; border-radius: 5px; min-width: 100px; text-align: center; border: 1px solid #333; flex-grow: 1; }
+            .metric-label { font-size: 0.8em; color: #aaa; margin-bottom: 5px; display: block; }
+            .metric-val { font-size: 1.3em; color: #4e9af1; font-weight: bold; font-family: monospace; }
+
+            #myGrid { height: 650px; width: 100%; border-radius: 8px; overflow: hidden; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h2>Interactive Validation Report</h2>
+                <button class="btn btn-download" onclick="downloadCSV()">Download CSV</button>
+            </div>
+
+            <div class="controls-panel">
+                <div class="input-group">
+                    <label>Negative (≤):</label>
+                    <input type="number" id="neg-input" step="0.01" value="-0.05">
+                </div>
+                <div class="input-group">
+                    <label>Positive (>):</label>
+                    <input type="number" id="pos-input" step="0.01" value="0.05">
+                </div>
+                <button class="btn btn-recalc" onclick="recalcAll()">Recalculate Metrics</button>
+            </div>
+
+            <div class="controls-panel">
+                <div class="metric-container">
+                    <div class="metric-card"><span class="metric-label">MSE</span><div id="val-mse" class="metric-val">-</div></div>
+                    <div class="metric-card"><span class="metric-label">Pearson</span><div id="val-pearson" class="metric-val">-</div></div>
+                    <div class="metric-card"><span class="metric-label">Pos F1</span><div id="val-f1-pos" class="metric-val">-</div></div>
+                    <div class="metric-card"><span class="metric-label">Pos MCC</span><div id="val-mcc-pos" class="metric-val">-</div></div>
+                    <div class="metric-card"><span class="metric-label">Accuracy</span><div id="val-acc" class="metric-val">-</div></div>
+                </div>
+            </div>
+
+            <div id="myGrid" class="ag-theme-alpine-dark"></div>
+        </div>
+
+        <script>
+            const rawData = {json_data};
+            let gridApi;
+
+            // --- 1. Definice Sloupců ---
+            let columnDefs = [];
+            if (rawData.length > 0) {{
+                const keys = Object.keys(rawData[0]);
+
+                // Prioritní sloupce (čísla)
+                const priority = ['predicted_fitness', 'actual_fitness', 'fitness'];
+
+                priority.forEach(key => {{
+                    if (keys.includes(key)) {{
+                        columnDefs.push({{ field: key, filter: 'agNumberColumnFilter', sortable: true, resizable: true, width: 110 }});
+                    }}
+                }});
+
+                // Klasifikační sloupce (obarvené)
+                columnDefs.push({{
+                    field: "predicted_class", headerName: "Pred Class", width: 120, cellStyle: params => {{
+                        if (params.value === 'Positive') return {{color: '#4caf50', fontWeight: 'bold'}};
+                        if (params.value === 'Negative') return {{color: '#f44336'}};
+                        return {{color: '#ff9800'}};
+                    }}
+                }});
+                columnDefs.push({{
+                    field: "actual_class", headerName: "Act Class", width: 120, cellStyle: params => {{
+                        if (params.value === 'Positive') return {{color: '#4caf50', fontWeight: 'bold'}};
+                        if (params.value === 'Negative') return {{color: '#f44336'}};
+                        return {{color: '#ff9800'}};
+                    }}
+                }});
+
+                // Ostatní textové sloupce
+                keys.forEach(key => {{
+                    if (!priority.includes(key) && key !== 'row_idx' && key !== 'predicted_class' && key !== 'actual_class') {{
+                        columnDefs.push({{ field: key, filter: 'agTextColumnFilter', sortable: true, resizable: true }});
+                    }}
+                }});
+            }}
+
+            function recalcAll() {{
+                if (!gridApi) return;
+
+                const negThresh = parseFloat(document.getElementById('neg-input').value);
+                const posThresh = parseFloat(document.getElementById('pos-input').value);
+
+                let tp=0, tn=0, fp=0, fn=0, correct=0;
+                let sumSq=0, sumXY=0, sumX=0, sumY=0, sumX2=0, sumY2=0;
+
+                // Iterace přes data a update tříd "in-place"
+                rawData.forEach(row => {{
+                    const pred = row.predicted_fitness;
+                    const act = row.actual_fitness;
+
+                    // Regrese
+                    sumSq += (pred-act)**2;
+                    sumX += act; sumY += pred;
+                    sumXY += act*pred;
+                    sumX2 += act**2; sumY2 += pred**2;
+
+                    // Klasifikace
+                    const getCls = v => v > posThresh ? 'Positive' : (v <= negThresh ? 'Negative' : 'Neutral');
+                    const pCls = getCls(pred);
+                    const aCls = getCls(act);
+
+                    // Update hodnot v objektu pro Grid
+                    row.predicted_class = pCls;
+                    row.actual_class = aCls;
+
+                    if(pCls === aCls) correct++;
+
+                    // MCC Metrics (Positive vs Rest)
+                    const pP = pCls === 'Positive';
+                    const aP = aCls === 'Positive';
+                    if(pP && aP) tp++;
+                    if(pP && !aP) fp++;
+                    if(!pP && !aP) tn++;
+                    if(!pP && aP) fn++;
+                }});
+
+                // Výpočet statistik
+                const n = rawData.length;
+                const mse = sumSq/n;
+                const num = n*sumXY - sumX*sumY;
+                const den = Math.sqrt((n*sumX2 - sumX**2)*(n*sumY2 - sumY**2));
+                const pearson = den===0 ? 0 : num/den;
+
+                const precision = tp+fp>0 ? tp/(tp+fp) : 0;
+                const recall = tp+fn>0 ? tp/(tp+fn) : 0;
+                const f1 = precision+recall>0 ? 2*precision*recall/(precision+recall) : 0;
+
+                const mccDen = Math.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn));
+                const mcc = mccDen===0 ? 0 : (tp*tn - fp*fn)/mccDen;
+
+                // Update UI
+                document.getElementById('val-mse').innerText = mse.toFixed(4);
+                document.getElementById('val-pearson').innerText = pearson.toFixed(3);
+                document.getElementById('val-f1-pos').innerText = f1.toFixed(3);
+                document.getElementById('val-mcc-pos').innerText = mcc.toFixed(3);
+                document.getElementById('val-acc').innerText = (correct/n*100).toFixed(1)+'%';
+
+                // --- CRITICAL FIX: Refresh Cells místo setRowData ---
+                // Toto zajistí, že se změny v 'predicted_class' a 'actual_class' projeví v tabulce
+                gridApi.refreshCells({{ force: true }});
+            }}
+
+            function downloadCSV() {{
+                if (gridApi) {{
+                    gridApi.exportDataAsCsv({{ fileName: 'validation_report.csv' }});
+                }}
+            }}
+
+            const gridOptions = {{
+                rowData: rawData,
+                columnDefs: columnDefs,
+                defaultColDef: {{ sortable: true, filter: true, resizable: true }},
+                onGridReady: params => {{
+                    gridApi = params.api;
+                    recalcAll(); // První výpočet hned po startu
+                }}
+            }};
+
+            document.addEventListener('DOMContentLoaded', () => {{
+                agGrid.createGrid(document.querySelector('#myGrid'), gridOptions);
+            }});
+        </script>
+    </body>
+    </html>
+    
