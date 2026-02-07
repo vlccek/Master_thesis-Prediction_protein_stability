@@ -32,9 +32,8 @@ export WANDB_DATA_DIR="${CONT_RUN_DIR}/wandb_data"
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
 
 # --- Training Configuration ---
-export EPOCHS_FULL=6
-export EPOCH_EXTREME=5
-export BATCH_SIZE=46
+export EPOCHS_FULL=4
+export BATCH_SIZE=47
 export BASE_DIR="/mnt/data/datasets/"
 # export DATASETS_PREFIX="dataset_split_"
 export DATASETS_PREFIX="dataset_homology_split_"
@@ -87,7 +86,6 @@ srun --cpu-bind=v,mask_cpu:$CPU_BIND_MASKS singularity exec --rocm -B ${PROJECT_
     --model_name="${MODEL_NAME}" \
     --seq_window_size ${SEQ_WINDOW_SIZE} \
     --freezed_layers ${FREEZED_LAYERS} \
-    --epochs_full ${EPOCHS_FULL} \
-    --epochs_extreme ${EPOCH_EXTREME} \
+    --epochs ${EPOCHS_FULL} \
     --save_folder "${CHECKPOINT_SAVE_FOLDER}" \
 

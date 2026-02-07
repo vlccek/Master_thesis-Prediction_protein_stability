@@ -9,17 +9,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 # Composer imports
 from composer import Trainer, Callback, State, Logger, Evaluator
-from composer.algorithms import GradientClipping
+from composer.algorithms import GradientClipping, StochasticDepth
 from composer.callbacks import EarlyStopper, LRMonitor, OptimizerMonitor, CheckpointSaver
 from composer.loggers import WandBLogger
 from composer.models import ComposerModel
 from composer.optim import DecoupledAdamW
+import torch_optimizer as optim
 from composer.optim.scheduler import CosineAnnealingWithWarmupScheduler
 from torch.utils.data import Dataset, DataLoader
 # Torchmetrics
-from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef, SpearmanCorrCoef, R2Score, \
+from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef, R2Score, \
     MeanAbsolutePercentageError, MatthewsCorrCoef, F1Score
-from transformers import BertModel, BertTokenizer
+from transformers import BertModel, BertTokenizer, AutoModelForSequenceClassification, AutoConfig
 from transformers import DataCollatorWithPadding
 
 
@@ -41,6 +42,7 @@ class Config:
     base_dir: str = "./"
     seq_window_size: int = 255
     save_folder: str = "checkpoints"
+    stochastic_depth_drop_rate: float = 0.2
 
 
 def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_size: int = 255):
@@ -171,6 +173,8 @@ class ProteinMutationDataset(Dataset):
 class ProteinMutationModel(nn.Module):
     def __init__(self, pretrained_model_name, tokenizer):
         super().__init__()
+
+
         self.bert = BertModel.from_pretrained(pretrained_model_name, add_pooling_layer=False)
         self.tokenizer = tokenizer
 
@@ -237,14 +241,13 @@ class ComposerProteinModel(ComposerModel):
         self.model = ProteinMutationModel(pretrained_model_name, tokenizer)
 
         # Používáme HuberLoss místo MSELoss - je méně citlivá na odlehlé hodnoty (šum v datech)
-        self.criterion = nn.HuberLoss(delta=1.0)
+        self.criterion = nn.HuberLoss(delta=0.2)
 
         self.val_metrics = nn.ModuleDict({
             'mse': MeanSquaredError(),
             'mae': MeanAbsoluteError(),
             'mape': MeanAbsolutePercentageError(),  # Přidáno MAPE
             'pearson': PearsonCorrCoef(),
-            'spearman': SpearmanCorrCoef(),
             'r2': R2Score(),
             'f1': F1Score(task="binary"),
             'mcc': MatthewsCorrCoef(task="binary"),
@@ -279,7 +282,6 @@ class ComposerProteinModel(ComposerModel):
             MeanAbsoluteError,
             MeanAbsolutePercentageError,
             PearsonCorrCoef,
-            SpearmanCorrCoef,
             R2Score
         )
 
@@ -545,6 +547,7 @@ def log_interactive_report_polars(df: pl.DataFrame, table_name: str, step: int =
         wandb.log(log_payload, step=step)
     else:
         wandb.log(log_payload)
+    return html_content
 
 
 from composer.utils import dist
@@ -629,7 +632,7 @@ class InteractiveReportCallback(Callback):
 
 
 # --- 6. Hlavní funkce ---
-def train_full_model(train_df_raw, val_df_raw, config, num_workers=8, epochs_full=5, epochs_extreme=2):
+def train_full_model(train_df_raw, val_df_raw, config, num_workers=8, epochs=5):
     print(f"Train samples: {len(train_df_raw)}, Validation samples: {len(val_df_raw)}")
 
     config_dict = asdict(config)
@@ -707,8 +710,8 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8, epochs_ful
         eval_interval="1ep"
     )
 
-    # 5. Optimizer & Scheduler
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
+
     # Změna: Ještě delší warmup (20%) - model se déle učí s rostoucím LR, což oddálí stagnaci
     scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.20dur", alpha_f=0.01)
 
@@ -728,9 +731,9 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8, epochs_ful
     save_path = os.path.join(config.base_dir, config.save_folder)
     checkpoint_saver = CheckpointSaver(
         folder=save_path,
-        filename="best_model_full.pt",
+        filename="model_epoch_{epoch}.pt",
         save_interval="1ep",
-        overwrite=True
+        overwrite=False
     )
 
     callbacks = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper, checkpoint_saver]
@@ -745,12 +748,12 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8, epochs_ful
     )
 
     # 7. Trainer (PHASE 1 - FULL DATASET)
-    print(f"=== Starting PHASE 1: Full Dataset Training ({epochs_full} epochs) ===")
+    print(f"=== Starting Training ({epochs} epochs) ===")
     trainer = Trainer(
         model=composer_model,
         train_dataloader=train_dataloader,
         eval_dataloader=[eval_frequent, eval_full],
-        max_duration=f"{epochs_full}ep",
+        max_duration=f"{epochs}ep",
         optimizers=optimizer,
         schedulers=scheduler,
 
@@ -768,74 +771,8 @@ def train_full_model(train_df_raw, val_df_raw, config, num_workers=8, epochs_ful
     )
 
     trainer.fit()
-    print("=== PHASE 1 Finished ===")
+    print("=== Training Finished ===")
 
     trainer.close()
-
-    # 8. Trainer (PHASE 2 - EXTREME SUBSET)
-    # Filtrování datasetu pro extrémní hodnoty (fitness > 0.3)
-    print("Filtering dataset for Phase 2 (Extreme Values: abs(fitness) > 0.3)...")
-
-    # Předpokládáme, že 'fitness' je název sloupce s targetem (prepare_data_dynamic ho přejmenovává)
-    if "fitness" in train_df.columns:
-        train_df_extreme = train_df.filter(pl.col("fitness").abs() > 0.3)
-    else:
-        print("WARNING: 'fitness' column not found, skipping Phase 2.")
-        train_df_extreme = pl.DataFrame()
-
-    print(f"Phase 2 Dataset size: {len(train_df_extreme)} samples.")
-
-    if epochs_extreme > 0:
-        print(f"=== Starting PHASE 2: Extreme Subset Training ({epochs_extreme} epochs) ===")
-
-        # Nový DataLoader pro extrémní data
-        train_dataset_extreme = ProteinMutationDataset(train_df_extreme, tokenizer, config.max_length)
-        train_sampler_extreme = dist.get_sampler(train_dataset_extreme, shuffle=True, drop_last=True)
-        train_dataloader_extreme = DataLoader(
-            train_dataset_extreme,
-            batch_size=config.batch_size,
-            sampler=train_sampler_extreme,
-            drop_last=True,
-            pin_memory=True,
-            num_workers=num_workers
-        )
-
-        # Pro druhou fázi vytvoříme nový Optimizer a Scheduler (fine-tuning)
-        optimizer_extreme = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
-        scheduler_extreme = CosineAnnealingWithWarmupScheduler(t_warmup="0.20dur", alpha_f=0.01)
-
-        # Checkpoint pro extreme phase (aby nepřepsal ten hlavní, pokud nechceme)
-        # Uložíme jako 'best_model_extreme.pt'
-        checkpoint_saver_extreme = CheckpointSaver(
-            folder=save_path,
-            filename="best_model_extreme.pt",
-            save_interval="1ep",
-            overwrite=True
-        )
-
-        callbacks_extreme = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper, checkpoint_saver_extreme]
-
-        # Nový Trainer instance
-        # Pozor: Používáme STEJNÝ composer_model (má už naučené váhy z Fáze 1)
-        trainer_extreme = Trainer(
-            model=composer_model,
-            train_dataloader=train_dataloader_extreme,
-            eval_dataloader=[eval_frequent, eval_full],
-            max_duration=f"{epochs_extreme}ep",
-            optimizers=optimizer_extreme,
-            schedulers=scheduler_extreme,
-            algorithms=[gc],
-            seed=42,
-            parallelism_config={'ddp': {'find_unused_parameters': True}},
-            callbacks=callbacks_extreme,
-            loggers=[wandb_logger],  # Logujeme do stejného W&B runu
-            device="gpu",
-            precision="amp_bf16"
-        )
-
-        trainer_extreme.fit()
-        print("=== PHASE 2 Finished ===")
-    else:
-        print("Skipping Phase 2 (Dataset too small or epochs set to 0).")
 
     print("Training finished successfully!")
