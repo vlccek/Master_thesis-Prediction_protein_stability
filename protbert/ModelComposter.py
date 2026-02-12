@@ -182,7 +182,7 @@ class ProteinMutationModel(nn.Module):
             self.bert.resize_token_embeddings(len(tokenizer))
 
         # hidden_size * 2 (Jen WT a MUT, bez CLS, přesně jako v Model.py)
-        input_dim = self.bert.config.hidden_size * 2
+        input_dim = self.bert.config.hidden_size * 3
 
         self.regressor_head = nn.Sequential(
             nn.Linear(input_dim, 1024),
@@ -227,7 +227,9 @@ class ProteinMutationModel(nn.Module):
         wt_repr = wt_sum / wt_count
         mut_repr = mut_sum / mut_count
 
-        combined_embeddings = torch.cat([wt_repr, mut_repr], dim=1)
+        diff = mut_repr - wt_repr
+
+        combined_embeddings = torch.cat([wt_repr, mut_repr, diff], dim=1)
         return self.regressor_head(combined_embeddings)
 
 
