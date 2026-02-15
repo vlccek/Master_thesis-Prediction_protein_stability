@@ -1,22 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=esm_composer_train
+#SBATCH --job-name=esm_composer_multinode
 #SBATCH --account=project_465002373
 #SBATCH --partition=standard-g
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
-#SBATCH --ntasks-per-node=8
-#SBATCH --cpus-per-task=7
-#SBATCH --time=00:15:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
+# --- Network & Distributed Setup ---
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29500
-export WORLD_SIZE=$SLURM_NPROCS
-export LOCAL_WORLD_SIZE=$SLURM_GPUS_PER_NODE
+export GPUS_PER_NODE=8
+export NNODES=$SLURM_NNODES
+export WORLD_SIZE=$(($GPUS_PER_NODE * $NNODES))
 
+echo "Master Addr: $MASTER_ADDR"
+echo "World Size: $WORLD_SIZE ($NNODES nodes x $GPUS_PER_NODE gpus)"
 
-# Nastavení cest na hostovi
+# --- Paths & Project Setup ---
 export PROJECT_DIR=/flash/project_465002373/protbert
 export MNT_DIR_CONTAINER=/mnt/data
 
@@ -28,28 +30,26 @@ mkdir -p "${HOST_RUN_DIR}"
 # Cesta uvnitř KONTEJNERU
 export CONT_RUN_DIR="${MNT_DIR_CONTAINER}/runs-esm/${START_TIME}"
 
-# --- CACHE SETUP (CRITICAL FIX FOR LLVM ERROR) ---
-# Vytvoříme složky na hostovi (scratch filesystém)
-export HOST_CACHE_ROOT="${PROJECT_DIR}/cache_system_v2" # Změnil jsem název pro čistý start
+# --- CACHE SETUP (CRITICAL FOR LUMI/AMD) ---
+export HOST_CACHE_ROOT="${PROJECT_DIR}/cache_system_v2"
 mkdir -p "${HOST_CACHE_ROOT}/tmp"
-mkdir -p "${HOST_CACHE_ROOT}/miopen"  # <--- CRITICAL PRO AMD
+mkdir -p "${HOST_CACHE_ROOT}/miopen"
 mkdir -p "${HOST_CACHE_ROOT}/triton"
 mkdir -p "${HOST_CACHE_ROOT}/torch"
 mkdir -p "${HOST_CACHE_ROOT}/hf"
-mkdir -p "${HOST_CACHE_ROOT}/mpl"     # Matplotlib cache
+mkdir -p "${HOST_CACHE_ROOT}/mpl"
 
-# Cesty uvnitř kontejneru (musí odpovídat bind mountu)
+# Cesty uvnitř kontejneru
 export CONT_CACHE_ROOT="${MNT_DIR_CONTAINER}/cache_system_v2"
 
 # --- Training Configuration ---
 export EPOCHS_FULL=5
-export BATCH_SIZE=2
+export BATCH_SIZE=2  # Global batch size bude: BATCH_SIZE * WORLD_SIZE
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_"
 export PROJECT_NAME="protein-mutation-prediction-esm2-composer"
 export MODEL_NAME="facebook/esm2_t36_3B_UR50D"
-export SEQ_WINDOW_SIZE=510
-export FREEZED_LAYERS=3
+export SEQ_WINDOW_SIZE=255
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
 
 # WandB paths
@@ -58,17 +58,46 @@ export WANDB_CACHE_DIR="${CONT_CACHE_ROOT}/wandb_cache"
 export WANDB_DATA_DIR="${CONT_CACHE_ROOT}/wandb_data"
 mkdir -p "${HOST_RUN_DIR}/wandb" "${HOST_CACHE_ROOT}/wandb_cache" "${HOST_CACHE_ROOT}/wandb_data"
 
-export CPU_BIND_MASKS="0x00fe000000000000,0xfe00000000000000,0x0000000000fe0000,0x00000000fe000000,0x00000000000000fe,0x000000000000fe00,0x000000fe00000000,0x0000fe0000000000"
+# --- LUMI Specific Hardware Settings ---
+# Upravená maska pro 1 task na uzel (pokrývá všechna jádra, Composer si to přebere)
+# Pokud by to dělalo problémy, lze masku odstranit, ale na LUMI je doporučeno vázat.
+# Zde používáme masku, která dovolí procesu vidět vše, protože Composer si thready managuje sám.
+export CPU_BIND="mask_cpu:0xffffffffffffff00"
 export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export NCCL_NET_GDR_LEVEL=PHB
+export NCCL_DEBUG=INFO # Pro debugování, pokud se to zasekne
 
 export CONTAINER=${PROJECT_DIR}/rocm-protbert-wand-composer-rocm7.1.1.sif
 
-echo "Spouštím trénink..."
+# --- Command Construction ---
 
-# --- SPUŠTĚNÍ S MIOPEN FIXEM ---
-# Důležité: Přidány proměnné MIOPEN_USER_DB_PATH a TRITON_HOME
-srun --cpu-bind=v,mask_cpu:$CPU_BIND_MASKS singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
+# Příkaz pro spuštění uvnitř kontejneru
+# Používáme proměnné předané přes srun/bash
+export COMPOSER_ARGS="--world_size $WORLD_SIZE \
+    --master_addr $MASTER_ADDR \
+    --master_port $MASTER_PORT"
+
+export SCRIPT_ARGS="--batch_size ${BATCH_SIZE} \
+    --base_dir ${BASE_DIR} \
+    --datasets_prefix ${DATASETS_PREFIX} \
+    --project_name ${PROJECT_NAME} \
+    --model_name ${MODEL_NAME} \
+    --seq_window_size ${SEQ_WINDOW_SIZE} \
+    --epochs ${EPOCHS_FULL} \
+    --save_folder ${CHECKPOINT_SAVE_FOLDER}"
+
+echo "Spouštím multi-node trénink na $NNODES uzlech..."
+
+# --- SPUŠTĚNÍ ---
+# 1. srun spustí 1 proces na každém uzlu (--ntasks-per-node=1)
+# 2. singularity spustí kontejner
+# 3. bash uvnitř kontejneru zjistí NODE_RANK ze SLURM_PROCID a spustí composer
+# 4. composer spustí 8 workerů (pro každou GPU)
+
+srun \
+    --ntasks-per-node=1 \
+    --cpus-per-task=56 \
+    singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
     --env WANDB_DIR=${WANDB_DIR} \
     --env WANDB_CACHE_DIR=${WANDB_CACHE_DIR} \
     --env WANDB_DATA_DIR=${WANDB_DATA_DIR} \
@@ -83,14 +112,10 @@ srun --cpu-bind=v,mask_cpu:$CPU_BIND_MASKS singularity exec --rocm -B ${PROJECT_
     --env TMPDIR=${CONT_CACHE_ROOT}/tmp \
     --env TMP=${CONT_CACHE_ROOT}/tmp \
     --env TEMP=${CONT_CACHE_ROOT}/tmp \
+    --env NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME} \
+    --env NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL} \
     $CONTAINER \
-    composer ${MNT_DIR_CONTAINER}/train_composer_esm.py \
-    --batch_size ${BATCH_SIZE} \
-    --base_dir="${BASE_DIR}" \
-    --datasets_prefix="${DATASETS_PREFIX}" \
-    --project_name="${PROJECT_NAME}"  \
-    --model_name="${MODEL_NAME}" \
-    --seq_window_size ${SEQ_WINDOW_SIZE} \
-    --freezed_layers ${FREEZED_LAYERS} \
-    --epochs ${EPOCHS_FULL} \
-    --save_folder "${CHECKPOINT_SAVE_FOLDER}"
+    bash -c "export NODE_RANK=\$SLURM_PROCID && \
+             echo \"Node Rank: \$NODE_RANK / World Size: $WORLD_SIZE\" && \
+             composer $COMPOSER_ARGS --node_rank \$NODE_RANK \
+             ${MNT_DIR_CONTAINER}/train_composer_esm.py $SCRIPT_ARGS"

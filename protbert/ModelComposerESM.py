@@ -7,57 +7,55 @@ import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 # Composer imports
 from composer import Trainer, Callback, State, Logger, Evaluator
-from composer.algorithms import GradientClipping, StochasticDepth
+from composer.algorithms import GradientClipping
 from composer.callbacks import EarlyStopper, LRMonitor, OptimizerMonitor, CheckpointSaver
 from composer.loggers import WandBLogger
 from composer.models import ComposerModel
 from composer.optim import DecoupledAdamW
-import torch_optimizer as optim
 from composer.optim.scheduler import CosineAnnealingWithWarmupScheduler
 from torch.utils.data import Dataset, DataLoader
-# Torchmetrics
-from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef, R2Score, MeanAbsolutePercentageError, MatthewsCorrCoef, F1Score
-from transformers import EsmTokenizer, EsmModel, AutoConfig, AutoTokenizer
-from transformers import DataCollatorWithPadding
+from composer.utils import dist
 
-# Configuration for ESM2
+# Torchmetrics
+from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef, R2Score, \
+    MeanAbsolutePercentageError, MatthewsCorrCoef, F1Score
+
+# Transformers imports
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+
+# --- Configuration for ESM2 ---
 @dataclass
 class ConfigESM:
     project_name: str = "protein-mutation-prediction-esm2"
-    pretrained_model: str = "facebook/esm2_t33_650M_UR50D" # Specific ESM2 model
+    pretrained_model: str = "facebook/esm2_t33_650M_UR50D"  # 650M parameter model
     wandb_token: str = ""
-    max_length: int = 1024 # ESM2 models often have specific max lengths
-    batch_size: int = 48
-    learning_rate: float = 5e-5
-    hidden_dropout_prob: float = 0.1
-    epochs: float = 15
-    freeze_layers: int = 3
-    early_stopping_patience: int = 2
+    max_length: int = 1024
+    batch_size: int = 24  # Reduced batch size (ESM2 is heavier than ProtBERT)
+    learning_rate: float = 2e-5
+    epochs: int = 15
+    early_stopping_patience: int = 3
     early_stopping_delta: float = 0.001
-    step_validation: int = 1500
     base_dir: str = "./"
-    seq_window_size: int = 255 # Should be compatible with ESM2's max length if truncation happens
+    seq_window_size: int = 511  # ESM2 context is larger, we can use larger windows
     save_folder: str = "checkpoints_esm2"
-    stochastic_depth_drop_rate: float = 0.2
 
 
-# === Data Preparation (Copied from ModelComposter.py, assumed generic) ===
+# --- Data Preparation Helper ---
 def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_size: int = 511):
     """
-    Přijme DF, přidá sloupce 'clean_wt' a 'clean_mut' (ořezané).
-    Logika: Vytvoří okno o velikosti `window_size` kolem mutace.
+    Standard data prep: Cuts sequences around the mutation.
     """
-
-    # 1. Standardizace názvů sloupců
+    # 1. Standardize column names
     if "target" in df.columns and "fitness" not in df.columns:
         df = df.rename({"target": "fitness"})
     if "mutation" not in df.columns and "mut_type" in df.columns:
         df = df.rename({"mut_type": "mutation"})
 
-    # 2. Priorita: Použít předvypočítané fragmenty (POUZE pokud sedí velikost okna)
-    # Předpokládáme, že sloupce 'fragment_255_org' odpovídají oknu 255.
+    # 2. Priority: Use pre-calculated fragments
     if window_size == 255 and "fragment_255_org" in df.columns and "fragment_255_mut" in df.columns:
         print("INFO: Using pre-calculated fragments (fragment_255_org/mut).")
         df_processed = df.with_columns([
@@ -66,26 +64,21 @@ def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_
         ])
         return df_processed
 
-    # 3. Dynamický výpočet (pro homology dataset nebo jinou délku okna)
+    # 3. Dynamic calculation
     print(f"INFO: Calculating fragments dynamically (Window={window_size}).")
 
-    # Sjednocení názvů vstupních sekvencí
     if "original_seq_full" in df.columns:
         df = df.rename({"original_seq_full": "wt_sequence", "mutated_seq_full": "mut_sequence"})
 
     if "wt_sequence" not in df.columns:
         raise ValueError(f"Dataset missing 'wt_sequence'. Columns: {df.columns}")
 
-    # Funkce pro nalezení indexu mutace (prioritně z popisu 'mutation')
     def get_mutation_idx(row):
         import re
-        # Pokusíme se parsovat číslo z "A168V"
         if row['mutation']:
             match = re.search(r'\d+', str(row['mutation']))
             if match:
                 return int(match.group(0)) - 1
-
-        # Fallback: Porovnání sekvencí
         s1, s2 = row['wt_sequence'], row['mut_sequence']
         for i in range(min(len(s1), len(s2))):
             if s1[i] != s2[i]:
@@ -117,30 +110,18 @@ def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_
     return df_processed
 
 
-# --- 1. Dataset (Adapted for ESM tokenizer) ---
+# --- 1. Dataset ---
 class ProteinMutationDatasetESM(Dataset):
     def __init__(self, processed_df: pl.DataFrame, tokenizer, max_length=1024):
-        """
-        Args:
-            processed_df: Výstup z funkce prepare_data_with_polars
-            tokenizer: HuggingFace tokenizer (ESM compatible)
-        """
         self.tokenizer = tokenizer
-
-        # ESM tokenizers usually don't require spaces between amino acids
         self.wt_seqs = processed_df["clean_wt"].to_list()
         self.mut_seqs = processed_df["clean_mut"].to_list()
         self.targets = processed_df["fitness"].to_list()
-
         self.max_length = max_length
         self.ids = list(range(len(self.targets)))
 
     def __len__(self):
         return len(self.targets)
-
-    # Removed add_spaces, as ESM tokenizers handle sequences directly
-    # def add_spaces(self, seq):
-    #     return " ".join(seq)
 
     def __getitem__(self, idx):
         seq_wt = self.wt_seqs[idx]
@@ -148,224 +129,63 @@ class ProteinMutationDatasetESM(Dataset):
         target = self.targets[idx]
         row_id = self.ids[idx]
 
-        # Tokenize directly, ESM tokenizers typically don't need token_type_ids for single sequences
-        # When concatenating two sequences like this, ESM tokenizers usually handle the separation.
+        # Tokenize as a pair. ESM tokenizer will handle special tokens automatically.
+        # Usually: <s> WT </s> </s> MUT </s>
         inputs = self.tokenizer(
             seq_wt,
             seq_mut,
             truncation=True,
             max_length=self.max_length,
             padding='max_length',
-            return_tensors='pt' # Return PyTorch tensors directly
+            return_tensors='pt'
         )
 
         return {
             'input_ids': inputs['input_ids'].squeeze(),
             'attention_mask': inputs['attention_mask'].squeeze(),
-            # ESM models typically don't use token_type_ids for protein sequences,
-            # especially not in the same way BERT does for sentence pair tasks.
-            # Removing it for now, can be added back if a specific ESM model requires it.
-            # 'token_type_ids': torch.tensor(inputs['token_type_ids'], dtype=torch.long),
+            # ESM usually doesn't use token_type_ids, but we'll grab them if they exist
+            'token_type_ids': inputs.get('token_type_ids', torch.zeros_like(inputs['input_ids'])).squeeze(),
             'labels': torch.tensor(target, dtype=torch.float),
             'row_idx': torch.tensor(row_id, dtype=torch.long)
         }
 
 
-# --- 2. Model (Adapted for ESM2 Architecture) ---
-class ProteinMutationModelESM(nn.Module):
-    def __init__(self, pretrained_model_name, tokenizer):
-        super().__init__()
-
-        # 1. Zkusíme vypnout pooler přes konfiguraci
-        self.esm_model = EsmModel.from_pretrained(pretrained_model_name, add_pooling_layer=False)
-        self.tokenizer = tokenizer
-
-        # Odstranění Pooleru (pokud ho konfig neodstranil)
-        if hasattr(self.esm_model, 'pooler') and self.esm_model.pooler is not None:
-            del self.esm_model.pooler
-
-        # Odstranění Contact Head (častý viník u ESM modelů)
-        if hasattr(self.esm_model, 'contact_head') and self.esm_model.contact_head is not None:
-            del self.esm_model.contact_head
-
-        # Resize token embeddings if tokenizer vocabulary is larger
-        if len(tokenizer) > self.esm_model.config.vocab_size:
-            self.esm_model.resize_token_embeddings(len(tokenizer))
-
-        # ESM2 models typically have a 'last_hidden_state' from the main model output
-        input_dim = self.esm_model.config.hidden_size * 3 # WT, MUT, DIFF
-
-        self.regressor_head = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.BatchNorm1d(1024),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(256, 1)
-        )
-
-    def forward(self, input_ids, attention_mask): # Removed token_type_ids
-        outputs = self.esm_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        # ESM models usually return a BaseModelOutputWithPoolingAndCrossAttentions
-        sequence_output = outputs.last_hidden_state
-
-        sep_token_id = self.tokenizer.sep_token_id
-        # FIX: Pokud není sep_token definován, použijeme eos_token (u ESM je to obvykle </s>)
-        if sep_token_id is None:
-            sep_token_id = self.tokenizer.eos_token_id
-
-        # Find the index of the first SEP token
-        # This assumes the tokenizer places `seq_wt [SEP] seq_mut [SEP]`
-        # We need to find the SEP that separates WT from MUT.
-        first_sep_mask = (input_ids == sep_token_id)
-
-        # Get the index of the first SEP token (which separates WT and MUT)
-        # Using argmax here for the first occurrence of sep_token_id
-        # FIX: Převedeme boolean masku na long (0/1), aby argmax fungoval správně
-        sep_indices = torch.argmax(first_sep_mask.long(), dim=1)
-
-
-        # Create masks for WT and MUT based on the separator index
-        # WT sequence is from index 1 (after <cls>) to sep_indices - 1
-        # MUT sequence is from sep_indices + 1 to the second sep_indices - 1 (if multiple) or end
-        arange_mask = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
-
-        # WT mask: from after CLS (index 1) up to the first SEP token
-        wt_mask = (arange_mask > 0) & (arange_mask < sep_indices.unsqueeze(1)) & attention_mask.bool()
-        
-        # MUT mask: from after the first SEP token to the end of the sequence
-        # This needs careful handling. If tokenizer concatenates as 'seq_wt <sep> seq_mut <sep>',
-        # then the second sep is at the very end.
-        # Let's find the second SEP token's index if it exists, or use attention_mask for end.
-        # A simpler approach might be to identify the start of the second sequence.
-        
-        # For simplicity, assuming `seq_wt [SEP] seq_mut [SEP]` structure,
-        # where the first SEP divides them. The second SEP is typically at the end of the input.
-        # We need to find the start of the mut_sequence which is `sep_indices + 1`.
-        # The end of mut_sequence would be where attention_mask ends, or before the *next* SEP if it's a batch.
-        
-        # Let's refine the mut_mask to start after the first SEP.
-        # It should end before the final SEP token added by the tokenizer if any.
-        
-        # For ESM tokenization: `<s> Sequence1 </s> Sequence2 </s>`
-        # `<s>` is typically ID 0, `</s>` is ID 2.
-        # `sep_token_id` is 2.
-        # `sep_indices` will give the index of the first `</s>`.
-        
-        # wt_mask: tokens between `<s>` and first `</s>`
-        # mut_mask: tokens between first `</s>` and second `</s>`
-        
-        # To get the second SEP index more robustly, we can find all sep tokens
-        all_sep_indices = (input_ids == sep_token_id).nonzero(as_tuple=True)
-        
-        # For each batch item, get the index of the first and second SEP.
-        # If there's only one, then it's `seq_wt [SEP] seq_mut`.
-        # If there are two, it's `seq_wt [SEP] seq_mut [SEP]`.
-        
-        # This part is crucial and dependent on how the tokenizer handles two sequences.
-        # Let's assume the common `seq_wt [SEP] seq_mut [SEP]` pattern where the first SEP divides them.
-        
-        # A more robust way to get the start of the second sequence (mut_sequence)
-        # is to check where token_type_ids would typically switch if ESM used them,
-        # or rely on the tokenizer's specific output for `seq_wt, seq_mut`.
-        
-        # Let's try to simulate the BERT-like segment averaging, assuming the first sep divides.
-        # WT representation: average of tokens from index 1 (after CLS/bos) up to first SEP.
-        # MUT representation: average of tokens from after first SEP up to second SEP (or end).
-
-        # For ESM, usually tokens are <cls> AA AA ... <sep> BB BB ... <sep>
-        # The first sep_indices correctly points to the end of seq_wt.
-        # The second sequence starts at sep_indices + 1.
-        # The end of the second sequence is usually the last token before the *last* sep token,
-        # or simply the end of the attention mask if the tokenizer didn't add a trailing sep.
-
-        # Let's verify the ESM tokenizer behavior:
-        # tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
-        # tokenized = tokenizer("AAAA", "BBBB", return_tensors="pt")
-        # print(tokenized)
-        # outputs:
-        # {'input_ids': tensor([[0, 6, 6, 6, 6, 2, 6, 6, 6, 6, 2]]),
-        #  'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])}
-        # IDs: 0=<s>, 2=</s> (SEP), 6=A.
-        # So it's <s> AAAA </s> BBBB </s>.
-        # First SEP is at index 5. Second SEP is at index 10.
-
-        # Correcting masks based on ESM tokenizer behavior:
-        
-        # Find all SEP token indices for each item in the batch
-        # This will be tricky with torch.argmax if there are multiple.
-        # Let's get the indices directly.
-        
-        # We need the index of the first `</s>` (which is `sep_token_id`) to define end of WT
-        # And the index of the last `</s>` to define end of MUT (if it exists)
-        
-        wt_start = 1 # After <s>
-        
-        # Find first sep token for each batch item (end of WT)
-        # Using a loop for clarity, can be vectorized
-        first_sep_indices = []
-        for i in range(input_ids.size(0)):
-            # Find all occurrences of sep_token_id in this sequence
-            sep_positions = (input_ids[i] == sep_token_id).nonzero(as_tuple=True)[0]
-            if len(sep_positions) > 0:
-                first_sep_indices.append(sep_positions[0].item())
-            else:
-                # Fallback: if no sep token found, assume whole sequence is WT
-                first_sep_indices.append(input_ids.size(1))
-        first_sep_indices = torch.tensor(first_sep_indices, device=input_ids.device)
-
-        # Find last sep token for each batch item (end of MUT)
-        last_sep_indices = []
-        for i in range(input_ids.size(0)):
-            sep_positions = (input_ids[i] == sep_token_id).nonzero(as_tuple=True)[0]
-            if len(sep_positions) > 1: # If there's at least a second sep
-                last_sep_indices.append(sep_positions[-1].item())
-            elif len(sep_positions) == 1: # Only one sep means mut goes to end of attention_mask
-                 last_sep_indices.append(attention_mask[i].sum().item())
-            else: # No sep tokens at all
-                last_sep_indices.append(attention_mask[i].sum().item()) # Mut covers remaining attention
-        last_sep_indices = torch.tensor(last_sep_indices, device=input_ids.device)
-
-        wt_mask = (arange_mask >= wt_start) & (arange_mask < first_sep_indices.unsqueeze(1)) & attention_mask.bool()
-        mut_start_after_first_sep = first_sep_indices + 1
-        mut_mask = (arange_mask >= mut_start_after_first_sep.unsqueeze(1)) & (arange_mask < last_sep_indices.unsqueeze(1)) &  attention_mask.bool()
-                   
-        wt_sum = (sequence_output * wt_mask.unsqueeze(-1).float()).sum(dim=1)
-        mut_sum = (sequence_output * mut_mask.unsqueeze(-1).float()).sum(dim=1)
-
-        wt_count = wt_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
-        mut_count = mut_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
-
-        wt_repr = wt_sum / wt_count
-        mut_repr = mut_sum / mut_count
-
-        diff = mut_repr - wt_repr
-
-        combined_embeddings = torch.cat([wt_repr, mut_repr, diff], dim=1)
-        return self.regressor_head(combined_embeddings)
-
-
-# --- 3. Composer Wrapper (Copied as is, assumed generic) ---
 class ComposerProteinModelESM(ComposerModel):
     def __init__(self, pretrained_model_name, tokenizer):
         super().__init__()
 
         self.classification_threshold = 0.0
 
-        self.model = ProteinMutationModelESM(pretrained_model_name, tokenizer)
+        # Načtení modelu
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            pretrained_model_name,
+            num_labels=1,
+            problem_type="regression"
+        )
+
+        self.model.gradient_checkpointing_enable()
+
+        # Zkusíme najít base model (obvykle uložen jako .esm)
+        base_model = getattr(self.model, "esm", None)
+
+        if base_model is not None:
+            # Odstranění Contact Head (pokud existuje)
+            if hasattr(base_model, "contact_head"):
+                base_model.contact_head = None
+
+            # Odstranění Pooleru (pokud existuje)
+            # EsmForSequenceClassification používá vlastní hlavičku nad hidden_states,
+            # takže původní pooler je zbytečný a způsobuje DDP chybu.
+            if hasattr(base_model, "pooler"):
+                base_model.pooler = None
+
+        # Resize embeddings
+        if len(tokenizer) > self.model.config.vocab_size:
+            self.model.resize_token_embeddings(len(tokenizer))
 
         self.criterion = nn.HuberLoss(delta=0.2)
 
+        # --- Metriky ---
         self.val_metrics = nn.ModuleDict({
             'mse': MeanSquaredError(),
             'mae': MeanAbsoluteError(),
@@ -376,13 +196,14 @@ class ComposerProteinModelESM(ComposerModel):
             'mcc': MatthewsCorrCoef(task="binary"),
         })
 
+
     def forward(self, batch):
-        return self.model(
+        outputs = self.model(
             input_ids=batch['input_ids'],
             attention_mask=batch['attention_mask'],
-            # token_type_ids is removed for ESM
-            # token_type_ids=batch.get('token_type_ids')
+            token_type_ids=batch.get('token_type_ids')
         )
+        return outputs.logits
 
     def loss(self, outputs, batch):
         return self.criterion(outputs.squeeze(), batch["labels"])
@@ -394,7 +215,6 @@ class ComposerProteinModelESM(ComposerModel):
 
     def update_metric(self, batch, outputs, metric):
         targets = batch["labels"]
-
         predictions = outputs.squeeze()
 
         regression_metrics = (
@@ -413,32 +233,9 @@ class ComposerProteinModelESM(ComposerModel):
             metric.update(binary_preds, binary_targets)
 
 
-# --- 4. Helper function for freezing layers (Adapted for ESM) ---
-def freeze_esm_layers(model, num_layers_to_freeze):
-    """
-    Zmrazí embeddingy a prvních N vrstev encoderu ESM modelu.
-    """
-    if num_layers_to_freeze == 0:
-        return
-
-    print(f"INFO: Freezing embeddings and first {num_layers_to_freeze} ESM encoder layers.")
-
-    # ESM embeddings are usually under `esm_model.embeddings`
-    for param in model.esm_model.embeddings.parameters():
-        param.requires_grad = False
-
-    # ESM encoder layers are usually under `esm_model.encoder.layer`
-    for i in range(num_layers_to_freeze):
-        if i < len(model.esm_model.encoder.layer):
-            for param in model.esm_model.encoder.layer[i].parameters():
-                param.requires_grad = False
-        else:
-            print(f"WARNING: Cannot freeze layer {i}, ESM model has only {len(model.esm_model.encoder.layer)} layers.")
-
-
-# --- HTML Report Generator (Copied as is) ---
+# --- 3. HTML Report Generator ---
 import wandb
-from composer.utils import dist
+
 
 def log_interactive_report_polars(df: pl.DataFrame, table_name: str, step: int = None):
     df_export = df.select([
@@ -451,25 +248,27 @@ def log_interactive_report_polars(df: pl.DataFrame, table_name: str, step: int =
 
     json_data = df_export.write_json()
 
-    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'html_templates', 'interactive_report_template.html')
-    # Make sure 'interactive_report_template.html' exists in '../html_templates/'
-    try:
-        with open(template_path, 'r') as f:
-            html_template_str = f.read()
-    except FileNotFoundError:
-        print(f"WARNING: interactive_report_template.html not found at {template_path}. Skipping HTML report.")
-        return "" # Return empty string or handle error appropriately
+    # Path to template
+    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'html_templates',
+                                 'interactive_report_template.html')
+
+    if not os.path.exists(template_path):
+        print(f"WARNING: Template not found at {template_path}")
+        return
+
+    with open(template_path, 'r') as f:
+        html_template_str = f.read()
 
     html_content = html_template_str.format(json_data=json_data, table_name=table_name)
     log_payload = {table_name: wandb.Html(html_content)}
+
     if step is not None:
         wandb.log(log_payload, step=step)
     else:
         wandb.log(log_payload)
-    return html_content
 
 
-class InteractiveReportCallbackESM(Callback): # Renamed for clarity
+class InteractiveReportCallbackESM(Callback):
     def __init__(self, log_function, val_original_df: pl.DataFrame):
         self.log_func = log_function
         try:
@@ -478,25 +277,20 @@ class InteractiveReportCallbackESM(Callback): # Renamed for clarity
             self.val_original_df = val_original_df.with_row_count(name="row_idx")
         self.preds = []
         self.indices = []
-        self.targets = []
 
     def eval_batch_end(self, state: State, logger: Logger):
         if state.dataloader_label == "full_val":
             outputs = state.outputs.detach().float().cpu().numpy().flatten().tolist()
-            targets = state.batch['labels'].detach().float().cpu().numpy().flatten().tolist()
             batch_indices = state.batch['row_idx'].detach().cpu().numpy().flatten().tolist()
             self.preds.extend(outputs)
-            self.targets.extend(targets)
             self.indices.extend(batch_indices)
 
     def eval_end(self, state: State, logger: Logger):
         all_preds = [None for _ in range(dist.get_world_size())]
         all_indices = [None for _ in range(dist.get_world_size())]
-        all_targets = [None for _ in range(dist.get_world_size())]
 
         torch.distributed.all_gather_object(all_preds, self.preds)
         torch.distributed.all_gather_object(all_indices, self.indices)
-        torch.distributed.all_gather_object(all_targets, self.targets)
 
         if dist.get_global_rank() == 0:
             full_preds = [item for sublist in all_preds for item in sublist]
@@ -506,11 +300,9 @@ class InteractiveReportCallbackESM(Callback): # Renamed for clarity
                 preds_df = pl.DataFrame({
                     "row_idx": full_indices,
                     "predicted_fitness": full_preds
-                })
+                }).with_columns(pl.col("row_idx").cast(pl.UInt32))
 
-                preds_df = preds_df.with_columns(pl.col("row_idx").cast(pl.UInt32))
                 self.val_original_df = self.val_original_df.with_columns(pl.col("row_idx").cast(pl.UInt32))
-
                 final_df = self.val_original_df.join(preds_df, on="row_idx", how="inner")
 
                 if "fitness" in final_df.columns and "actual_fitness" not in final_df.columns:
@@ -529,7 +321,7 @@ class InteractiveReportCallbackESM(Callback): # Renamed for clarity
         self.indices = []
 
 
-# --- 6. Main Training Function for ESM2 ---
+# --- 4. Main Training Function for ESM2 ---
 def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, epochs=5):
     print(f"Train samples: {len(train_df_raw)}, Validation samples: {len(val_df_raw)}")
 
@@ -539,7 +331,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
     print(f"The config: {json.dumps(config_dict)}")
 
     # 1. Tokenizer
-    # ESM tokenizers do not require `do_lower_case=False`
+    # AutoTokenizer is safer for ESM than EsmTokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model)
 
     print(f"Preprocessing Training Data (Window Size: {config.seq_window_size})...")
@@ -556,9 +348,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
     # 2. Model
     composer_model = ComposerProteinModelESM(config.pretrained_model, tokenizer)
 
-    # === Apply layer freezing ===
-    freeze_depth = getattr(config, 'freeze_layers', 0)
-    freeze_esm_layers(composer_model.model, freeze_depth)
+    # NOTE: No freezing here. Full fine-tuning.
 
     # 3. DataLoaders
     train_dataset = ProteinMutationDatasetESM(train_df, tokenizer, config.max_length)
@@ -604,11 +394,10 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
     )
 
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
-
     scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.20dur", alpha_f=0.01)
 
-    # 6. Callbacks
-    html_callback = InteractiveReportCallbackESM( # Changed to ESM specific callback
+    # 5. Callbacks
+    html_callback = InteractiveReportCallbackESM(
         log_function=log_interactive_report_polars,
         val_original_df=validation_df
     )
@@ -628,8 +417,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
         overwrite=False
     )
 
-    callbacks = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper, checkpoint_saver]
-
+    callbacks = [LRMonitor(), html_callback, early_stopper, checkpoint_saver]
     gc = GradientClipping(clipping_type='norm', clipping_threshold=1.0)
 
     wandb_logger = WandBLogger(
@@ -639,7 +427,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
         rank_zero_only=True
     )
 
-    # 7. Trainer
+    # 6. Trainer
     print(f"=== Starting ESM2 Training ({epochs} epochs) ===")
     trainer = Trainer(
         model=composer_model,
@@ -661,4 +449,3 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
     print("=== ESM2 Training Finished ===")
     trainer.close()
     print("ESM2 Training finished successfully!")
-
