@@ -32,7 +32,7 @@ export WANDB_DATA_DIR="${CONT_RUN_DIR}/wandb_data"
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
 
 # --- Training Configuration ---
-export EPOCHS_FULL=4
+export EPOCHS_FULL=5
 export BATCH_SIZE=47
 export BASE_DIR="/mnt/data/datasets/"
 # export DATASETS_PREFIX="dataset_split_"
