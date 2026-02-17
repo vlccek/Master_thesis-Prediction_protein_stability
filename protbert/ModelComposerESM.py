@@ -160,24 +160,29 @@ class ComposerProteinModelESM(ComposerModel):
         self.model = AutoModelForSequenceClassification.from_pretrained(
             pretrained_model_name,
             num_labels=1,
-            problem_type="regression"
+            problem_type="regression",
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True
         )
 
         self.model.gradient_checkpointing_enable()
 
         # Zkusíme najít base model (obvykle uložen jako .esm)
-        base_model = getattr(self.model, "esm", None)
+        if hasattr(self.model, "esm"):
+            base_model = self.model.esm
 
-        if base_model is not None:
-            # Odstranění Contact Head (pokud existuje)
             if hasattr(base_model, "contact_head"):
+                del base_model.contact_head
                 base_model.contact_head = None
 
-            # Odstranění Pooleru (pokud existuje)
-            # EsmForSequenceClassification používá vlastní hlavičku nad hidden_states,
-            # takže původní pooler je zbytečný a způsobuje DDP chybu.
             if hasattr(base_model, "pooler"):
+                del base_model.pooler
                 base_model.pooler = None
+
+        # --- FIX: Freeze parameters that ESM-2 bypasses ---
+        for name, param in self.model.named_parameters():
+            if "position_embeddings" in name:
+                param.requires_grad = False
 
         # Resize embeddings
         if len(tokenizer) > self.model.config.vocab_size:
@@ -196,13 +201,9 @@ class ComposerProteinModelESM(ComposerModel):
             'mcc': MatthewsCorrCoef(task="binary"),
         })
 
-
     def forward(self, batch):
-        outputs = self.model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            token_type_ids=batch.get('token_type_ids')
-        )
+        inputs = {k: v for k, v in batch.items() if k in ['input_ids', 'attention_mask']}
+        outputs = self.model(**inputs)
         return outputs.logits
 
     def loss(self, outputs, batch):
@@ -322,7 +323,7 @@ class InteractiveReportCallbackESM(Callback):
 
 
 # --- 4. Main Training Function for ESM2 ---
-def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, epochs=5):
+def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, epochs=5):
     print(f"Train samples: {len(train_df_raw)}, Validation samples: {len(val_df_raw)}")
 
     config_dict = asdict(config)
@@ -384,7 +385,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
         dataloader=val_loader_subset,
         metric_names=['mse', 'pearson'],
         subset_num_batches=20,
-        eval_interval="2000ba"
+        eval_interval="200ba"
     )
 
     eval_full = Evaluator(
@@ -438,11 +439,11 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=8, 
         schedulers=scheduler,
         algorithms=[gc],
         seed=42,
-        parallelism_config={'ddp': {'find_unused_parameters': True}},
+        parallelism_config={'ddp': {'find_unused_parameters': True}, },
         callbacks=callbacks,
         loggers=[wandb_logger],
         device="gpu",
-        precision="amp_bf16"
+        precision="amp_bf16",
     )
 
     trainer.fit()

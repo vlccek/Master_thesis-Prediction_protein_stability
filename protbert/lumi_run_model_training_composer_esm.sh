@@ -44,11 +44,11 @@ export CONT_CACHE_ROOT="${MNT_DIR_CONTAINER}/cache_system_v2"
 
 # --- Training Configuration ---
 export EPOCHS_FULL=5
-export BATCH_SIZE=2  # Global batch size bude: BATCH_SIZE * WORLD_SIZE
+export BATCH_SIZE=64  # Global batch size bude: BATCH_SIZE * WORLD_SIZE
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_"
 export PROJECT_NAME="protein-mutation-prediction-esm2-composer"
-export MODEL_NAME="facebook/esm2_t36_3B_UR50D"
+export MODEL_NAME="fredzzp/esm2_t33_650M_UR50D"
 export SEQ_WINDOW_SIZE=255
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
 
@@ -67,7 +67,7 @@ export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export NCCL_NET_GDR_LEVEL=PHB
 export NCCL_DEBUG=INFO # Pro debugování, pokud se to zasekne
 
-export CONTAINER=${PROJECT_DIR}/rocm-protbert-wand-composer-rocm7.1.1.sif
+export CONTAINER=/flash/project_465002373/containers/rocm-esm-wandb-composer-rocm7.2_optimized.sif
 
 # --- Command Construction ---
 
@@ -96,7 +96,6 @@ echo "Spouštím multi-node trénink na $NNODES uzlech..."
 
 srun \
     --ntasks-per-node=1 \
-    --cpus-per-task=56 \
     singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
     --env WANDB_DIR=${WANDB_DIR} \
     --env WANDB_CACHE_DIR=${WANDB_CACHE_DIR} \
