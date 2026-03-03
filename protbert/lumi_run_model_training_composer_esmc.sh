@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=esm_composer_multinode
-#SBATCH --account=project_465002740
+#SBATCH --account=project_465002373
 #SBATCH --partition=standard-g
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --gpus-per-node=8
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
-# --- Network & Distributed Setup   ---
+# --- Network & Distributed Setup ---
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29500
 export GPUS_PER_NODE=8
@@ -19,17 +19,16 @@ echo "Master Addr: $MASTER_ADDR"
 echo "World Size: $WORLD_SIZE ($NNODES nodes x $GPUS_PER_NODE gpus)"
 
 # --- Paths & Project Setup ---
-export PROJECT_DIR=/flash/project_465002740/protbert
-export HTML_TEMPLATES_DIR=/flash/project_465002740/html_templates
+export PROJECT_DIR=/flash/project_465002373/protbert
 export MNT_DIR_CONTAINER=/mnt/data
 
 # --- Time-based Directory Setup ---
 export START_TIME=$(date +"%Y-%m-%d_%H-%M-%S")
-export HOST_RUN_DIR="${PROJECT_DIR}/runs-esm/${START_TIME}"
+export HOST_RUN_DIR="${PROJECT_DIR}/runs-esmc/${START_TIME}"
 mkdir -p "${HOST_RUN_DIR}"
 
 # Cesta uvnitř KONTEJNERU
-export CONT_RUN_DIR="${MNT_DIR_CONTAINER}/runs-esm/esm511${START_TIME}"
+export CONT_RUN_DIR="${MNT_DIR_CONTAINER}/runs-esmc/${START_TIME}"
 
 # --- CACHE SETUP (CRITICAL FOR LUMI/AMD) ---
 export HOST_CACHE_ROOT="${PROJECT_DIR}/cache_system_v2"
@@ -49,7 +48,7 @@ export BATCH_SIZE=64  # Global batch size bude: BATCH_SIZE * WORLD_SIZE
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_"
 export PROJECT_NAME="protein-mutation-prediction-esm2-composer"
-export MODEL_NAME="fredzzp/esm2_t33_650M_UR50D"
+export MODEL_NAME="EvolutionaryScale/esmc-600m-2024-12"
 export SEQ_WINDOW_SIZE=510
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
 
@@ -60,15 +59,12 @@ export WANDB_DATA_DIR="${CONT_CACHE_ROOT}/wandb_data"
 mkdir -p "${HOST_RUN_DIR}/wandb" "${HOST_CACHE_ROOT}/wandb_cache" "${HOST_CACHE_ROOT}/wandb_data"
 
 # --- LUMI Specific Hardware Settings ---
-# Upravená maska pro 1 task na uzel (pokrývá všechna jádra, Composer si to přebere)
-# Pokud by to dělalo problémy, lze masku odstranit, ale na LUMI je doporučeno vázat.
-# Zde používáme masku, která dovolí procesu vidět vše, protože Composer si thready managuje sám.
 export CPU_BIND="mask_cpu:0xffffffffffffff00"
 export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export NCCL_NET_GDR_LEVEL=PHB
 export NCCL_DEBUG=INFO # Pro debugování, pokud se to zasekne
 
-export CONTAINER=/flash/project_465002740/containers/rocm-esm-wandb-composer-rocm7.2.sif
+export CONTAINER=/flash/project_465002373/containers/rocm-esm-wandb-composer-rocm7.2_optimized.sif
 
 # --- Command Construction ---
 
@@ -97,7 +93,7 @@ echo "Spouštím multi-node trénink na $NNODES uzlech..."
 
 srun \
     --ntasks-per-node=1 \
-    singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} -B ${HTML_TEMPLATES_DIR}:/mnt/html_templates \
+    singularity exec --rocm -B ${PROJECT_DIR}:${MNT_DIR_CONTAINER} \
     --env WANDB_DIR=${WANDB_DIR} \
     --env WANDB_CACHE_DIR=${WANDB_CACHE_DIR} \
     --env WANDB_DATA_DIR=${WANDB_DATA_DIR} \

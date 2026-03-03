@@ -278,6 +278,9 @@ class ComposerProteinModelESM(ComposerModel):
         self.criterion = nn.HuberLoss(delta=0.2)
 
         # --- Metriky ---
+        self.train_metrics = nn.ModuleDict({
+            'mse': MeanSquaredError(),
+        })
         self.val_metrics = nn.ModuleDict({
             'mse': MeanSquaredError(),
             'mae': MeanAbsoluteError(),
@@ -301,7 +304,7 @@ class ComposerProteinModelESM(ComposerModel):
 
     def get_metrics(self, is_train: bool = False):
         if is_train:
-            return {}
+            return self.train_metrics
         return self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
