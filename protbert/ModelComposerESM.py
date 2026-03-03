@@ -24,7 +24,7 @@ from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef, R
     MeanAbsolutePercentageError, MatthewsCorrCoef, F1Score
 
 # Transformers imports
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, EsmModel
 
 
 # --- Configuration for ESM2 ---
@@ -150,43 +150,130 @@ class ProteinMutationDatasetESM(Dataset):
         }
 
 
+class ESMProteinMutationCore(nn.Module):
+    def __init__(self, pretrained_model_name, tokenizer):
+        super().__init__()
+
+        # Načtení základního ESM modelu
+        self.esm = EsmModel.from_pretrained(
+            pretrained_model_name,
+            torch_dtype=torch.bfloat16
+        )
+        self.tokenizer = tokenizer
+
+        # --- FIX PRO DDP: Odstranění nepoužívaných vrstev ---
+        # EsmModel má defaultně 'pooler' vrstvu, kterou my nepoužíváme (děláme vlastní mean pooling).
+        # Pokud ji nesmažeme, DDP spadne, protože tyto parametry nedostanou gradient.
+        if hasattr(self.esm, 'pooler') and self.esm.pooler is not None:
+            del self.esm.pooler
+            self.esm.pooler = None
+
+        # Někdy může existovat i contact_head (záleží na verzi/konfiguraci), pro jistotu:
+        if hasattr(self.esm, 'contact_head') and self.esm.contact_head is not None:
+            del self.esm.contact_head
+            self.esm.contact_head = None
+
+        # Resize, pokud je to potřeba (přidané tokeny)
+        if len(tokenizer) > self.esm.config.vocab_size:
+            self.esm.resize_token_embeddings(len(tokenizer))
+
+        # Input dimenze pro MLP: hidden_size * 3 (WT rep, MUT rep, Difference rep)
+        input_dim = self.esm.config.hidden_size * 2
+
+        # MLP Hlava
+        self.regressor_head = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.GELU(),
+            nn.Dropout(0.25),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(0.25),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, input_ids, attention_mask):
+        # Volání ESM
+        outputs = self.esm(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        sequence_output = outputs.last_hidden_state
+
+        sep_token_id = self.tokenizer.sep_token_id
+        if sep_token_id is None:
+            sep_token_id = self.tokenizer.eos_token_id
+
+        # --- Logika masek (zachována z vašeho kódu) ---
+        arange_mask = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0),
+                                                                                                   -1)
+
+        # Rychlejší vektorizované hledání indexů (bez Python cyklu, pokud možno)
+        # Ale pro zachování funkčnosti vašeho logiky s "first" a "last" sep:
+
+        # Najdeme pozice SEP tokenů
+        is_sep = (input_ids == sep_token_id)
+
+        # Kumulativní součet nám řekne, kolikátý SEP to je
+        sep_cumsum = is_sep.cumsum(dim=1)
+
+        # Celkový počet SEP v každém řádku
+        total_seps = is_sep.sum(dim=1, keepdim=True)
+
+        # WT maska: Všechno před prvním SEP (sep_cumsum == 0) a není to padding
+        # Poznámka: arange_mask > 0 ignoruje CLS token na začátku
+        wt_mask = (arange_mask > 0) & (sep_cumsum == 0) & attention_mask.bool()
+
+        # MUT maska: Všechno po prvním SEP.
+        # Logika: Jsme za prvním SEP (sep_cumsum >= 1)
+        # A ZÁROVEŇ nejsme na samotném SEP tokenu (not is_sep)
+        # A ZÁROVEŇ nejsme za posledním SEP (pokud existuje druhý SEP, chceme končit před ním?)
+        # Váš původní kód bral "mezi prvním a posledním SEP".
+
+        # Zjednodušená robustní logika pro WT [SEP] MUT [SEP]:
+        # WT je tam, kde jsme ještě nenarazili na SEP.
+        # MUT je tam, kde jsme narazili na 1. SEP, ale ještě ne na 2. SEP.
+
+        mut_mask = (sep_cumsum == 1) & (~is_sep) & attention_mask.bool()
+
+        # Mean Pooling
+        wt_sum = (sequence_output * wt_mask.unsqueeze(-1).float()).sum(dim=1)
+        mut_sum = (sequence_output * mut_mask.unsqueeze(-1).float()).sum(dim=1)
+
+        wt_count = wt_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
+        mut_count = mut_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
+
+        wt_repr = wt_sum / wt_count
+        mut_repr = mut_sum / mut_count
+
+        diff = mut_repr - wt_repr
+
+        combined_embeddings = torch.cat([wt_repr, mut_repr], dim=1)
+        return self.regressor_head(combined_embeddings)
+
+
 class ComposerProteinModelESM(ComposerModel):
     def __init__(self, pretrained_model_name, tokenizer):
         super().__init__()
 
         self.classification_threshold = 0.0
 
-        # Načtení modelu
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            pretrained_model_name,
-            num_labels=1,
-            problem_type="regression",
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True
-        )
+        # Inicializace našeho vlastního modelu definovaného výše
+        self.model = ESMProteinMutationCore(pretrained_model_name, tokenizer)
 
-        self.model.gradient_checkpointing_enable()
+        # --- Optimalizace a Freezing ---
+        # Povolení gradient checkpointing pro ESM encoder (šetří VRAM)
+        self.model.esm.gradient_checkpointing_enable()
 
-        # Zkusíme najít base model (obvykle uložen jako .esm)
-        if hasattr(self.model, "esm"):
-            base_model = self.model.esm
-
-            if hasattr(base_model, "contact_head"):
-                del base_model.contact_head
-                base_model.contact_head = None
-
-            if hasattr(base_model, "pooler"):
-                del base_model.pooler
-                base_model.pooler = None
-
-        # --- FIX: Freeze parameters that ESM-2 bypasses ---
+        # Zmrazení pozičních embeddingů
         for name, param in self.model.named_parameters():
             if "position_embeddings" in name:
                 param.requires_grad = False
-
-        # Resize embeddings
-        if len(tokenizer) > self.model.config.vocab_size:
-            self.model.resize_token_embeddings(len(tokenizer))
 
         self.criterion = nn.HuberLoss(delta=0.2)
 
@@ -202,9 +289,12 @@ class ComposerProteinModelESM(ComposerModel):
         })
 
     def forward(self, batch):
-        inputs = {k: v for k, v in batch.items() if k in ['input_ids', 'attention_mask']}
-        outputs = self.model(**inputs)
-        return outputs.logits
+        # Vytáhneme jen to, co model potřebuje.
+        # ESM nepoužívá token_type_ids, a naše logika je nepotřebuje.
+        return self.model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask']
+        )
 
     def loss(self, outputs, batch):
         return self.criterion(outputs.squeeze(), batch["labels"])
@@ -250,7 +340,7 @@ def log_interactive_report_polars(df: pl.DataFrame, table_name: str, step: int =
     json_data = df_export.write_json()
 
     # Path to template
-    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'html_templates',
+    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mnt', 'html_templates',
                                  'interactive_report_template.html')
 
     if not os.path.exists(template_path):
@@ -418,7 +508,8 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         overwrite=False
     )
 
-    callbacks = [LRMonitor(), html_callback, early_stopper, checkpoint_saver]
+    callbacks = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper, checkpoint_saver]
+
     gc = GradientClipping(clipping_type='norm', clipping_threshold=1.0)
 
     wandb_logger = WandBLogger(
@@ -439,7 +530,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         schedulers=scheduler,
         algorithms=[gc],
         seed=42,
-        parallelism_config={'ddp': {'find_unused_parameters': True}, },
+        # parallelism_config={'ddp': {'find_unused_parameters': True}, },
         callbacks=callbacks,
         loggers=[wandb_logger],
         device="gpu",
