@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=esm_composer_multinode
+#SBATCH --job-name=esm_composer
 #SBATCH --account=project_465002740
 #SBATCH --partition=standard-g
 #SBATCH --nodes=1
@@ -44,13 +44,13 @@ mkdir -p "${HOST_CACHE_ROOT}/mpl"
 export CONT_CACHE_ROOT="${MNT_DIR_CONTAINER}/cache_system_v2"
 
 # --- Training Configuration ---
-export EPOCHS_FULL=5
+export EPOCHS_FULL=1
 export BATCH_SIZE=64  # Global batch size bude: BATCH_SIZE * WORLD_SIZE
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_"
-export PROJECT_NAME="protein-mutation-prediction-esm2-composer"
+export PROJECT_NAME="ESM-Siamese"
 export MODEL_NAME="fredzzp/esm2_t33_650M_UR50D"
-export SEQ_WINDOW_SIZE=510
+export SEQ_WINDOW_SIZE=127
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
 
 # WandB paths

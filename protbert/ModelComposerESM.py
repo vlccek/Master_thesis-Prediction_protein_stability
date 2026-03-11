@@ -129,22 +129,17 @@ class ProteinMutationDatasetESM(Dataset):
         target = self.targets[idx]
         row_id = self.ids[idx]
 
-        # Tokenize as a pair. ESM tokenizer will handle special tokens automatically.
-        # Usually: <s> WT </s> </s> MUT </s>
-        inputs = self.tokenizer(
-            seq_wt,
-            seq_mut,
-            truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            return_tensors='pt'
-        )
+        # Tokenizujeme zvlášť!
+        inputs_wt = self.tokenizer(seq_wt, truncation=True, max_length=self.max_length, padding='max_length',
+                                   return_tensors='pt')
+        inputs_mut = self.tokenizer(seq_mut, truncation=True, max_length=self.max_length, padding='max_length',
+                                    return_tensors='pt')
 
         return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            # ESM usually doesn't use token_type_ids, but we'll grab them if they exist
-            'token_type_ids': inputs.get('token_type_ids', torch.zeros_like(inputs['input_ids'])).squeeze(),
+            'input_ids_wt': inputs_wt['input_ids'].squeeze(),
+            'attention_mask_wt': inputs_wt['attention_mask'].squeeze(),
+            'input_ids_mut': inputs_mut['input_ids'].squeeze(),
+            'attention_mask_mut': inputs_mut['attention_mask'].squeeze(),
             'labels': torch.tensor(target, dtype=torch.float),
             'row_idx': torch.tensor(row_id, dtype=torch.long)
         }
@@ -178,104 +173,88 @@ class ESMProteinMutationCore(nn.Module):
             self.esm.resize_token_embeddings(len(tokenizer))
 
         # Input dimenze pro MLP: hidden_size * 3 (WT rep, MUT rep, Difference rep)
-        input_dim = self.esm.config.hidden_size * 2
+        input_dim = self.esm.config.hidden_size * 3
+
+        hidden_size = self.esm.config.hidden_size
 
         # MLP Hlava
         self.regressor_head = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.BatchNorm1d(1024),
+            nn.Linear(input_dim, 512),
             nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(256, 1)
+            nn.Dropout(0.1),  # Stačí malý dropout, ESM už je regularizovaný dost
+            nn.Linear(512, 1)
         )
 
-    def forward(self, input_ids, attention_mask):
-        # Volání ESM
-        outputs = self.esm(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+        self.attention_pooler = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
         )
-        sequence_output = outputs.last_hidden_state
 
-        sep_token_id = self.tokenizer.sep_token_id
-        if sep_token_id is None:
-            sep_token_id = self.tokenizer.eos_token_id
+    def attention_pooling(self, last_hidden_state, attention_mask):
+        # 1. Spočítáme raw skóre pro každý token -> [batch_size, seq_len, 1]
+        scores = self.attention_pooler(last_hidden_state)
 
-        # --- Logika masek (zachována z vašeho kódu) ---
-        arange_mask = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0),
-                                                                                                   -1)
+        # 2. Zbavíme se poslední dimenze -> [batch_size, seq_len]
+        scores = scores.squeeze(-1)
 
-        # Rychlejší vektorizované hledání indexů (bez Python cyklu, pokud možno)
-        # Ale pro zachování funkčnosti vašeho logiky s "first" a "last" sep:
+        # 3. Maskování: Tam, kde je padding (maska == 0), dáme obrovské záporné číslo.
+        # Používáme -1e9 místo -inf, je to bezpečnější pro bfloat16 (prevence NaN)
+        scores = scores.masked_fill(~attention_mask.bool(), -1e9)
 
-        # Najdeme pozice SEP tokenů
-        is_sep = (input_ids == sep_token_id)
+        # 4. Softmax: Převod skóre na procentuální váhy (0.0 až 1.0)
+        weights = F.softmax(scores, dim=-1)
 
-        # Kumulativní součet nám řekne, kolikátý SEP to je
-        sep_cumsum = is_sep.cumsum(dim=1)
+        # 5. Weighted Sum: Vynásobíme hidden states vahami a sečteme
+        # weights.unsqueeze(-1) vrátí tvar na [batch, seq_len, 1] pro správné násobení matic
+        pooled_output = torch.sum(last_hidden_state * weights.unsqueeze(-1), dim=1)
 
-        # Celkový počet SEP v každém řádku
-        total_seps = is_sep.sum(dim=1, keepdim=True)
+        return pooled_output
 
-        # WT maska: Všechno před prvním SEP (sep_cumsum == 0) a není to padding
-        # Poznámka: arange_mask > 0 ignoruje CLS token na začátku
-        wt_mask = (arange_mask > 0) & (sep_cumsum == 0) & attention_mask.bool()
+    def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut):
+        # 1. Čistý průchod pro Wild Type
+        out_wt = self.esm(input_ids=input_ids_wt, attention_mask=attention_mask_wt)
 
-        # MUT maska: Všechno po prvním SEP.
-        # Logika: Jsme za prvním SEP (sep_cumsum >= 1)
-        # A ZÁROVEŇ nejsme na samotném SEP tokenu (not is_sep)
-        # A ZÁROVEŇ nejsme za posledním SEP (pokud existuje druhý SEP, chceme končit před ním?)
-        # Váš původní kód bral "mezi prvním a posledním SEP".
+        # 2. Čistý průchod pro Mutaci
+        out_mut = self.esm(input_ids=input_ids_mut, attention_mask=attention_mask_mut)
 
-        # Zjednodušená robustní logika pro WT [SEP] MUT [SEP]:
-        # WT je tam, kde jsme ještě nenarazili na SEP.
-        # MUT je tam, kde jsme narazili na 1. SEP, ale ještě ne na 2. SEP.
-
-        mut_mask = (sep_cumsum == 1) & (~is_sep) & attention_mask.bool()
-
-        # Mean Pooling
-        wt_sum = (sequence_output * wt_mask.unsqueeze(-1).float()).sum(dim=1)
-        mut_sum = (sequence_output * mut_mask.unsqueeze(-1).float()).sum(dim=1)
-
-        wt_count = wt_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
-        mut_count = mut_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
-
-        wt_repr = wt_sum / wt_count
-        mut_repr = mut_sum / mut_count
+        # 2. Aplikace našeho nového Attention Poolingu
+        wt_repr = self.attention_pooling(out_wt.last_hidden_state, attention_mask_wt)
+        mut_repr = self.attention_pooling(out_mut.last_hidden_state, attention_mask_mut)
 
         diff = mut_repr - wt_repr
+        combined_embeddings = torch.cat([wt_repr, mut_repr, diff], dim=1)
 
-        combined_embeddings = torch.cat([wt_repr, mut_repr], dim=1)
         return self.regressor_head(combined_embeddings)
 
-
 class ComposerProteinModelESM(ComposerModel):
-    def __init__(self, pretrained_model_name, tokenizer):
+    def __init__(self, pretrained_model_name, tokenizer, freeze_encoder=True):  # <--- NOVÝ PARAMETR
         super().__init__()
 
         self.classification_threshold = 0.0
-
-        # Inicializace našeho vlastního modelu definovaného výše
         self.model = ESMProteinMutationCore(pretrained_model_name, tokenizer)
 
-        # --- Optimalizace a Freezing ---
-        # Povolení gradient checkpointing pro ESM encoder (šetří VRAM)
-        self.model.esm.gradient_checkpointing_enable()
+        # --- 1. ZMRAZENÍ BACKBONE (Linear Probing) ---
+        if freeze_encoder:
+            print(f"INFO: Zmrazuji ESM encoder (Linear Probing). Učí se pouze MLP hlava.")
+            for param in self.model.esm.parameters():
+                param.requires_grad = False
 
-        # Zmrazení pozičních embeddingů
+            # Ujistíme se, že Regressor Head je odemčená
+            for param in self.model.regressor_head.parameters():
+                param.requires_grad = True
+        else:
+            print(f"INFO: Full Fine-Tuning (ESM encoder je odemčený).")
+            # Pokud děláme full fine-tuning, chceme gradient checkpointing pro úsporu paměti
+            self.model.esm.gradient_checkpointing_enable()
+
+        # Zmrazení pozičních embeddingů (vždy dobrý nápad u ESM)
         for name, param in self.model.named_parameters():
             if "position_embeddings" in name:
                 param.requires_grad = False
 
-        self.criterion = nn.HuberLoss(delta=0.2)
+        # self.criterion = nn.HuberLoss(delta=0.2)
+        self.criterion = nn.MSELoss()
 
         # --- Metriky ---
         self.train_metrics = nn.ModuleDict({
@@ -294,9 +273,12 @@ class ComposerProteinModelESM(ComposerModel):
     def forward(self, batch):
         # Vytáhneme jen to, co model potřebuje.
         # ESM nepoužívá token_type_ids, a naše logika je nepotřebuje.
+        # def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut)
         return self.model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
+            input_ids_wt=batch['input_ids_wt'],
+            attention_mask_wt=batch['attention_mask_wt'],
+            input_ids_mut=batch['input_ids_mut'],
+            attention_mask_mut=batch['attention_mask_mut']
         )
 
     def loss(self, outputs, batch):
@@ -488,7 +470,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
     )
 
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
-    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.20dur", alpha_f=0.01)
+    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.40dur", alpha_f=0.01)
 
     # 5. Callbacks
     html_callback = InteractiveReportCallbackESM(
