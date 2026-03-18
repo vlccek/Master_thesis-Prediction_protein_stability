@@ -44,13 +44,13 @@ mkdir -p "${HOST_CACHE_ROOT}/mpl"
 export CONT_CACHE_ROOT="${MNT_DIR_CONTAINER}/cache_system_v2"
 
 # --- Training Configuration ---
-export EPOCHS_FULL=1
-export BATCH_SIZE=64  # Global batch size bude: BATCH_SIZE * WORLD_SIZE
+export EPOCHS_FULL=2
+export BATCH_SIZE=32
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_"
 export PROJECT_NAME="ESM-Siamese"
-export MODEL_NAME="fredzzp/esm2_t33_650M_UR50D"
-export SEQ_WINDOW_SIZE=127
+export MODEL_NAME="facebook/esm2_t33_650M_UR50D"
+export SEQ_WINDOW_SIZE=500
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
 
 # WandB paths

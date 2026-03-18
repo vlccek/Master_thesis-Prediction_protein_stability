@@ -35,7 +35,7 @@ class ConfigESM:
     wandb_token: str = ""
     max_length: int = 1024
     batch_size: int = 24  # Reduced batch size (ESM2 is heavier than ProtBERT)
-    learning_rate: float = 2e-5
+    learning_rate: float = 2e-6
     epochs: int = 15
     early_stopping_patience: int = 3
     early_stopping_delta: float = 0.001
@@ -172,63 +172,87 @@ class ESMProteinMutationCore(nn.Module):
         if len(tokenizer) > self.esm.config.vocab_size:
             self.esm.resize_token_embeddings(len(tokenizer))
 
-        # Input dimenze pro MLP: hidden_size * 3 (WT rep, MUT rep, Difference rep)
-        input_dim = self.esm.config.hidden_size * 3
-
         hidden_size = self.esm.config.hidden_size
+
+        input_dim = hidden_size * 9
 
         # MLP Hlava
         self.regressor_head = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.GELU(),
-            nn.Dropout(0.1),  # Stačí malý dropout, ESM už je regularizovaný dost
+            nn.Dropout(0.1),
             nn.Linear(512, 1)
         )
 
-        self.attention_pooler = nn.Sequential(
-            nn.Linear(hidden_size, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1)
-        )
+    def spatial_mean_pooling(self, hidden_state, attention_mask, mut_indices, window_size=15):
+        """
+        Rozdělí protein na 3 části (L, C, R) přesně okolo detekované mutace.
+        window_size = 15 znamená střed o velikosti 31 tokenů (+/- 15 od mutace).
+        """
+        batch_size, seq_len, _ = hidden_state.size()
+        device = hidden_state.device
 
-    def attention_pooling(self, last_hidden_state, attention_mask):
-        # 1. Spočítáme raw skóre pro každý token -> [batch_size, seq_len, 1]
-        scores = self.attention_pooler(last_hidden_state)
+        # Vytvoříme matici všech indexů [batch_size, seq_len]
+        pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-        # 2. Zbavíme se poslední dimenze -> [batch_size, seq_len]
-        scores = scores.squeeze(-1)
+        # mut_indices je 1D pole, potřebujeme ho roztáhnout pro maskování -> [batch_size, 1]
+        mut_idx = mut_indices.unsqueeze(1)
 
-        # 3. Maskování: Tam, kde je padding (maska == 0), dáme obrovské záporné číslo.
-        # Používáme -1e9 místo -inf, je to bezpečnější pro bfloat16 (prevence NaN)
-        scores = scores.masked_fill(~attention_mask.bool(), -1e9)
+        # Dynamické masky okolo PŘESNÉHO indexu mutace
+        center_mask = (pos >= (mut_idx - window_size)) & (pos <= (mut_idx + window_size))
+        left_mask = (pos > 0) & (pos < (mut_idx - window_size))  # >0 ignoruje CLS token
+        right_mask = (pos > (mut_idx + window_size))
 
-        # 4. Softmax: Převod skóre na procentuální váhy (0.0 až 1.0)
-        weights = F.softmax(scores, dim=-1)
+        # Ořízneme masky o globální padding (aby pravý okraj nesahal do prázdna)
+        center_mask = center_mask & attention_mask.bool()
+        left_mask = left_mask & attention_mask.bool()
+        right_mask = right_mask & attention_mask.bool()
 
-        # 5. Weighted Sum: Vynásobíme hidden states vahami a sečteme
-        # weights.unsqueeze(-1) vrátí tvar na [batch, seq_len, 1] pro správné násobení matic
-        pooled_output = torch.sum(last_hidden_state * weights.unsqueeze(-1), dim=1)
+        # Pomocná funkce pro pooling s ochranou proti dělení nulou
+        def masked_mean(h_state, mask):
+            mask_float = mask.unsqueeze(-1).float()  # [batch, seq_len, 1]
+            sum_h = torch.sum(h_state * mask_float, dim=1)
+            # Zabrání NaN, pokud je některá část úplně prázdná (např. mutace je hned na indexu 1)
+            sum_mask = torch.clamp(mask_float.sum(dim=1), min=1e-9)
+            return sum_h / sum_mask
 
-        return pooled_output
+        center_pooled = masked_mean(hidden_state, center_mask)
+        left_pooled = masked_mean(hidden_state, left_mask)
+        right_pooled = masked_mean(hidden_state, right_mask)
+
+        return torch.cat([left_pooled, center_pooled, right_pooled], dim=1)
 
     def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut):
-        # 1. Čistý průchod pro Wild Type
-        out_wt = self.esm(input_ids=input_ids_wt, attention_mask=attention_mask_wt)
+        # 0. ABSOLUTNÍ JISTOTA: Najdeme index mutace přímo z rozdílu tokenů
+        # Kde se tokeny nerovnají (True), převedeme na int (1). Argmax vrátí index první jedničky.
+        mut_indices = torch.argmax((input_ids_wt != input_ids_mut).int(), dim=1)
 
-        # 2. Čistý průchod pro Mutaci
-        out_mut = self.esm(input_ids=input_ids_mut, attention_mask=attention_mask_mut)
+        # 1. TRIK pro DDP: Spojíme WT a MUT do jednoho batche nad sebou
+        combined_input_ids = torch.cat([input_ids_wt, input_ids_mut], dim=0)
+        combined_attention_mask = torch.cat([attention_mask_wt, attention_mask_mut], dim=0)
 
-        # 2. Aplikace našeho nového Attention Poolingu
-        wt_repr = self.attention_pooling(out_wt.last_hidden_state, attention_mask_wt)
-        mut_repr = self.attention_pooling(out_mut.last_hidden_state, attention_mask_mut)
+        # 2. JEDEN JEDINÝ PRŮCHOD MODELM
+        out_combined = self.esm(input_ids=combined_input_ids, attention_mask=combined_attention_mask)
 
+        # 3. ROZDĚLENÍ ZPĚT NA WT A MUT
+        batch_size = input_ids_wt.size(0)
+        wt_hidden_state = out_combined.last_hidden_state[:batch_size]
+        mut_hidden_state = out_combined.last_hidden_state[batch_size:]
+
+        # 4. APLIKACE SPATIAL POOLINGU (Teď s poslaným mut_indices a window_size 15 = 31AA)
+        wt_repr = self.spatial_mean_pooling(wt_hidden_state, attention_mask_wt, mut_indices, window_size=15)
+        mut_repr = self.spatial_mean_pooling(mut_hidden_state, attention_mask_mut, mut_indices, window_size=15)
+
+        # 5. Výpočet rozdílu a spojení do hlavy
         diff = mut_repr - wt_repr
+
         combined_embeddings = torch.cat([wt_repr, mut_repr, diff], dim=1)
 
         return self.regressor_head(combined_embeddings)
 
+
 class ComposerProteinModelESM(ComposerModel):
-    def __init__(self, pretrained_model_name, tokenizer, freeze_encoder=True):  # <--- NOVÝ PARAMETR
+    def __init__(self, pretrained_model_name, tokenizer, freeze_encoder=True):
         super().__init__()
 
         self.classification_threshold = 0.0
@@ -470,7 +494,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
     )
 
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
-    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="0.40dur", alpha_f=0.01)
+    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="500ba", alpha_f=0.01)
 
     # 5. Callbacks
     html_callback = InteractiveReportCallbackESM(
