@@ -4,7 +4,7 @@
 #SBATCH --partition=standard-g
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
-#SBATCH --time=48:00:00
+#SBATCH --time=13:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -44,7 +44,7 @@ mkdir -p "${HOST_CACHE_ROOT}/mpl"
 export CONT_CACHE_ROOT="${MNT_DIR_CONTAINER}/cache_system_v2"
 
 # --- Training Configuration ---
-export EPOCHS_FULL=2
+export EPOCHS_FULL=5
 export BATCH_SIZE=32
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_"
@@ -85,7 +85,8 @@ export SCRIPT_ARGS="--batch_size ${BATCH_SIZE} \
     --model_name ${MODEL_NAME} \
     --seq_window_size ${SEQ_WINDOW_SIZE} \
     --epochs ${EPOCHS_FULL} \
-    --save_folder ${CHECKPOINT_SAVE_FOLDER}"
+    --save_folder ${CHECKPOINT_SAVE_FOLDER} \
+    --lr 1e-4 "
 
 echo "Spouštím multi-node trénink na $NNODES uzlech..."
 

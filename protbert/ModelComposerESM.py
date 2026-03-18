@@ -157,13 +157,10 @@ class ESMProteinMutationCore(nn.Module):
         self.tokenizer = tokenizer
 
         # --- FIX PRO DDP: Odstranění nepoužívaných vrstev ---
-        # EsmModel má defaultně 'pooler' vrstvu, kterou my nepoužíváme (děláme vlastní mean pooling).
-        # Pokud ji nesmažeme, DDP spadne, protože tyto parametry nedostanou gradient.
         if hasattr(self.esm, 'pooler') and self.esm.pooler is not None:
             del self.esm.pooler
             self.esm.pooler = None
 
-        # Někdy může existovat i contact_head (záleží na verzi/konfiguraci), pro jistotu:
         if hasattr(self.esm, 'contact_head') and self.esm.contact_head is not None:
             del self.esm.contact_head
             self.esm.contact_head = None
@@ -174,9 +171,14 @@ class ESMProteinMutationCore(nn.Module):
 
         hidden_size = self.esm.config.hidden_size
 
-        input_dim = hidden_size * 9
+        # Attention pooling projekce
+        self.attn_query_wt = nn.Parameter(torch.randn(hidden_size))
+        self.attn_query_mut = nn.Parameter(torch.randn(hidden_size))
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
 
-        # MLP Hlava
+        # MLP Hlava - vstup je 4x hidden_size (wt_pooled + mut_pooled + diff + pooled_diff)
+        input_dim = hidden_size * 4
+
         self.regressor_head = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.GELU(),
@@ -184,54 +186,40 @@ class ESMProteinMutationCore(nn.Module):
             nn.Linear(512, 1)
         )
 
-    def spatial_mean_pooling(self, hidden_state, attention_mask, mut_indices, window_size=15):
+    def attention_pooling(self, hidden_state, attention_mask, query_param):
         """
-        Rozdělí protein na 3 části (L, C, R) přesně okolo detekované mutace.
-        window_size = 15 znamená střed o velikosti 31 tokenů (+/- 15 od mutace).
+        Simple attention pooling over all tokens.
+        Uses learnable query for each sequence type (WT/MUT).
         """
-        batch_size, seq_len, _ = hidden_state.size()
-        device = hidden_state.device
+        batch_size, seq_len, hidden_size = hidden_state.size()
 
-        # Vytvoříme matici všech indexů [batch_size, seq_len]
-        pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        # Compute keys from hidden states
+        keys = self.key_proj(hidden_state)  # [batch, seq, hidden]
 
-        # mut_indices je 1D pole, potřebujeme ho roztáhnout pro maskování -> [batch_size, 1]
-        mut_idx = mut_indices.unsqueeze(1)
+        # Compute attention scores using learnable query
+        query = query_param.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1)  # [batch, 1, hidden]
+        scores = torch.bmm(query, keys.transpose(-1, -2)).squeeze(1)  # [batch, seq]
 
-        # Dynamické masky okolo PŘESNÉHO indexu mutace
-        center_mask = (pos >= (mut_idx - window_size)) & (pos <= (mut_idx + window_size))
-        left_mask = (pos > 0) & (pos < (mut_idx - window_size))  # >0 ignoruje CLS token
-        right_mask = (pos > (mut_idx + window_size))
+        # Apply attention mask (ignore padding)
+        scores = scores.masked_fill(~attention_mask.bool(), -1e9)
 
-        # Ořízneme masky o globální padding (aby pravý okraj nesahal do prázdna)
-        center_mask = center_mask & attention_mask.bool()
-        left_mask = left_mask & attention_mask.bool()
-        right_mask = right_mask & attention_mask.bool()
+        # Softmax to get attention weights
+        attn_weights = F.softmax(scores, dim=-1)  # [batch, seq]
 
-        # Pomocná funkce pro pooling s ochranou proti dělení nulou
-        def masked_mean(h_state, mask):
-            mask_float = mask.unsqueeze(-1).float()  # [batch, seq_len, 1]
-            sum_h = torch.sum(h_state * mask_float, dim=1)
-            # Zabrání NaN, pokud je některá část úplně prázdná (např. mutace je hned na indexu 1)
-            sum_mask = torch.clamp(mask_float.sum(dim=1), min=1e-9)
-            return sum_h / sum_mask
+        # Apply attention to hidden states
+        pooled = torch.bmm(attn_weights.unsqueeze(1), hidden_state).squeeze(1)  # [batch, hidden]
 
-        center_pooled = masked_mean(hidden_state, center_mask)
-        left_pooled = masked_mean(hidden_state, left_mask)
-        right_pooled = masked_mean(hidden_state, right_mask)
-
-        return torch.cat([left_pooled, center_pooled, right_pooled], dim=1)
+        return pooled
 
     def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut):
-        # 0. ABSOLUTNÍ JISTOTA: Najdeme index mutace přímo z rozdílu tokenů
-        # Kde se tokeny nerovnají (True), převedeme na int (1). Argmax vrátí index první jedničky.
+        # 0. Najdeme index mutace přímo z rozdílu tokenů
         mut_indices = torch.argmax((input_ids_wt != input_ids_mut).int(), dim=1)
 
-        # 1. TRIK pro DDP: Spojíme WT a MUT do jednoho batche nad sebou
+        # 1. TRIK pro DDP: Spojíme WT a MUT do jednoho batche
         combined_input_ids = torch.cat([input_ids_wt, input_ids_mut], dim=0)
         combined_attention_mask = torch.cat([attention_mask_wt, attention_mask_mut], dim=0)
 
-        # 2. JEDEN JEDINÝ PRŮCHOD MODELM
+        # 2. JEDEN PRŮCHOD MODELM
         out_combined = self.esm(input_ids=combined_input_ids, attention_mask=combined_attention_mask)
 
         # 3. ROZDĚLENÍ ZPĚT NA WT A MUT
@@ -239,14 +227,15 @@ class ESMProteinMutationCore(nn.Module):
         wt_hidden_state = out_combined.last_hidden_state[:batch_size]
         mut_hidden_state = out_combined.last_hidden_state[batch_size:]
 
-        # 4. APLIKACE SPATIAL POOLINGU (Teď s poslaným mut_indices a window_size 15 = 31AA)
-        wt_repr = self.spatial_mean_pooling(wt_hidden_state, attention_mask_wt, mut_indices, window_size=15)
-        mut_repr = self.spatial_mean_pooling(mut_hidden_state, attention_mask_mut, mut_indices, window_size=15)
+        # 4. APLIKACE ATTENTION POOLINGU
+        wt_repr = self.attention_pooling(wt_hidden_state, attention_mask_wt, self.attn_query_wt)
+        mut_repr = self.attention_pooling(mut_hidden_state, attention_mask_mut, self.attn_query_mut)
 
-        # 5. Výpočet rozdílu a spojení do hlavy
+        # 5. Výpočet rozdílu a spojení
         diff = mut_repr - wt_repr
+        pooled_diff = self.attention_pooling(mut_hidden_state - wt_hidden_state, attention_mask_wt, self.attn_query_wt)
 
-        combined_embeddings = torch.cat([wt_repr, mut_repr, diff], dim=1)
+        combined_embeddings = torch.cat([wt_repr, mut_repr, diff, pooled_diff], dim=1)
 
         return self.regressor_head(combined_embeddings)
 
