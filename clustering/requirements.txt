@@ -1,0 +1,9 @@
+polars
+numpy
+scikit-learn
+hdbscan
+umap-learn
+matplotlib
+seaborn
+SciencePlots
+joblib
