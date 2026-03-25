@@ -28,7 +28,25 @@ rsync ~/dp/protbert/ /scratch/project_465002373/protbert/ -rPz
 
 
 # Workflow for dataset preparation
-1) for lehner dataset use `dataset_prepare_lehner.ipynb`
-2) for megasccale dataset use `dataset_prepare_megascale.ipynb` and `dataset_megascale_filtering.ipynb`
-3) For merging datasets use `dataset_merge_datasets.ipynb` there is also adding the homology anotattions
-4) for peraparation of 255w (two columns with 255AA that are used for traing model with context len of 512) dataset use `dataset_prepare_255w.ipynb`
+
+**Detailed documentation:** See [DATASET_WORKFLOW.md](DATASET_WORKFLOW.md) for comprehensive information about:
+- Data sources and normalization procedures
+- Piecewise sigmoid normalization parameters (separate for positive/negative values)
+- Complete workflow for both Lehner and Megascale datasets
+- File descriptions and statistics
+
+## Overview
+
+1) **Lehner dataset:** `lehner_dataset_preparation.ipynb`
+2) **Megascale dataset:** `megascale_dataset_preparation.ipynb` + `megascale_dataset_normalization.ipynb`
+3) **Merging datasets:** `merging_datasets.ipynb` (also adds CATH homology annotations)
+4) **255W preparation:** `dataset_prepare_255w.ipynb` (creates train/validation/test splits)
+
+## Normalization
+
+Both datasets use **piecewise sigmoid normalization** with separate parameters for positive and negative values:
+
+- **Lehner:** `k_neg = 0.871`, `k_pos = 0.871`
+- **Megascale:** `k_neg = 0.230`, `k_pos = 0.576`
+
+See `DATASET_WORKFLOW.md` for formulas and detailed explanation.
