@@ -44,8 +44,8 @@ mkdir -p "${HOST_CACHE_ROOT}/mpl"
 export CONT_CACHE_ROOT="${MNT_DIR_CONTAINER}/cache_system_v2"
 
 # --- Training Configuration ---
-export EPOCHS_FULL=5
-export BATCH_SIZE=32
+export EPOCHS_FULL=2
+export BATCH_SIZE=48
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_"
 export PROJECT_NAME="ESM-Siamese"
@@ -77,6 +77,10 @@ export CONTAINER=/flash/project_465002740/containers/rocm-esm-wandb-composer-roc
 export COMPOSER_ARGS="--world_size $WORLD_SIZE \
     --master_addr $MASTER_ADDR \
     --master_port $MASTER_PORT"
+
+# Optional: Set LOAD_PATH to resume training from a checkpoint
+# Example: export LOAD_PATH="/mnt/data/checkpoints/model_epoch_3.pt"
+export LOAD_PATH=""
 
 export SCRIPT_ARGS="--batch_size ${BATCH_SIZE} \
     --base_dir ${BASE_DIR} \

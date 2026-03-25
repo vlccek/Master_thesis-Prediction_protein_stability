@@ -519,6 +519,12 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
 
     # 6. Trainer
     print(f"=== Starting ESM2 Training ({epochs} epochs) ===")
+
+    # Resume training if load_path is provided
+    load_path = getattr(config, 'load_path', None)
+    if load_path:
+        print(f"Resuming training from: {load_path}")
+
     trainer = Trainer(
         model=composer_model,
         train_dataloader=train_dataloader,
@@ -528,6 +534,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         schedulers=scheduler,
         algorithms=[gc],
         seed=42,
+        load_path=load_path,
         # parallelism_config={'ddp': {'find_unused_parameters': True}, },
         callbacks=callbacks,
         loggers=[wandb_logger],
