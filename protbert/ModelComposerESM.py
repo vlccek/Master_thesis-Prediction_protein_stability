@@ -15,7 +15,6 @@ from composer.callbacks import EarlyStopper, LRMonitor, OptimizerMonitor, Checkp
 from composer.loggers import WandBLogger
 from composer.models import ComposerModel
 from composer.optim import DecoupledAdamW
-from composer.optim.scheduler import CosineAnnealingWithWarmupScheduler
 from torch.utils.data import Dataset, DataLoader
 from composer.utils import dist
 
@@ -36,8 +35,11 @@ class ConfigESM:
     max_length: int = 1024
     batch_size: int = 24  # Reduced batch size (ESM2 is heavier than ProtBERT)
     learning_rate: float = 2e-6
-    epochs: int = 15
+    # INCREASED NUMBER OF EPOCHS FOR EARLY STOPPING
+    epochs: int = 50
     early_stopping_patience: int = 3
+    # NEW PARAMETER FOR FREQ_VAL EARLY STOPPER (must be greater than unfreeze callback patience)
+    early_stopping_patience_freq: int = 10
     early_stopping_delta: float = 0.001
     base_dir: str = "./"
     seq_window_size: int = 511  # ESM2 context is larger, we can use larger windows
@@ -49,13 +51,11 @@ def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_
     """
     Standard data prep: Cuts sequences around the mutation.
     """
-    # 1. Standardize column names
     if "target" in df.columns and "fitness" not in df.columns:
         df = df.rename({"target": "fitness"})
     if "mutation" not in df.columns and "mut_type" in df.columns:
         df = df.rename({"mut_type": "mutation"})
 
-    # 2. Priority: Use pre-calculated fragments
     if window_size == 255 and "fragment_255_org" in df.columns and "fragment_255_mut" in df.columns:
         print("INFO: Using pre-calculated fragments (fragment_255_org/mut).")
         df_processed = df.with_columns([
@@ -64,7 +64,6 @@ def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_
         ])
         return df_processed
 
-    # 3. Dynamic calculation
     print(f"INFO: Calculating fragments dynamically (Window={window_size}).")
 
     if "original_seq_full" in df.columns:
@@ -129,7 +128,7 @@ class ProteinMutationDatasetESM(Dataset):
         target = self.targets[idx]
         row_id = self.ids[idx]
 
-        # Tokenizujeme zvlášť!
+        # Tokenize separately!
         inputs_wt = self.tokenizer(seq_wt, truncation=True, max_length=self.max_length, padding='max_length',
                                    return_tensors='pt')
         inputs_mut = self.tokenizer(seq_mut, truncation=True, max_length=self.max_length, padding='max_length',
@@ -149,14 +148,14 @@ class ESMProteinMutationCore(nn.Module):
     def __init__(self, pretrained_model_name, tokenizer):
         super().__init__()
 
-        # Načtení základního ESM modelu
+        # Load base ESM model
         self.esm = EsmModel.from_pretrained(
             pretrained_model_name,
             torch_dtype=torch.bfloat16
         )
         self.tokenizer = tokenizer
 
-        # --- FIX PRO DDP: Odstranění nepoužívaných vrstev ---
+        # --- DDP FIX: Remove unused layers ---
         if hasattr(self.esm, 'pooler') and self.esm.pooler is not None:
             del self.esm.pooler
             self.esm.pooler = None
@@ -165,20 +164,19 @@ class ESMProteinMutationCore(nn.Module):
             del self.esm.contact_head
             self.esm.contact_head = None
 
-        # Resize, pokud je to potřeba (přidané tokeny)
+        # Resize if necessary (added tokens)
         if len(tokenizer) > self.esm.config.vocab_size:
             self.esm.resize_token_embeddings(len(tokenizer))
 
         hidden_size = self.esm.config.hidden_size
 
-        # Attention pooling projekce
+        # Attention pooling projection
         self.attn_query_wt = nn.Parameter(torch.randn(hidden_size))
         self.attn_query_mut = nn.Parameter(torch.randn(hidden_size))
         self.key_proj = nn.Linear(hidden_size, hidden_size)
 
-        # MLP Hlava - vstup je 4x hidden_size (wt_pooled + mut_pooled + diff + pooled_diff)
+        # MLP Head - input is 4x hidden_size (wt_pooled + mut_pooled + diff + pooled_diff)
         input_dim = hidden_size * 4
-
         self.regressor_head = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.GELU(),
@@ -187,89 +185,71 @@ class ESMProteinMutationCore(nn.Module):
         )
 
     def attention_pooling(self, hidden_state, attention_mask, query_param):
-        """
-        Simple attention pooling over all tokens.
-        Uses learnable query for each sequence type (WT/MUT).
-        """
         batch_size, seq_len, hidden_size = hidden_state.size()
-
-        # Compute keys from hidden states
-        keys = self.key_proj(hidden_state)  # [batch, seq, hidden]
-
-        # Compute attention scores using learnable query
-        query = query_param.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1)  # [batch, 1, hidden]
-        scores = torch.bmm(query, keys.transpose(-1, -2)).squeeze(1)  # [batch, seq]
-
-        # Apply attention mask (ignore padding)
+        keys = self.key_proj(hidden_state)
+        query = query_param.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1)
+        scores = torch.bmm(query, keys.transpose(-1, -2)).squeeze(1)
         scores = scores.masked_fill(~attention_mask.bool(), -1e9)
-
-        # Softmax to get attention weights
-        attn_weights = F.softmax(scores, dim=-1)  # [batch, seq]
-
-        # Apply attention to hidden states
-        pooled = torch.bmm(attn_weights.unsqueeze(1), hidden_state).squeeze(1)  # [batch, hidden]
-
+        attn_weights = F.softmax(scores, dim=-1)
+        pooled = torch.bmm(attn_weights.unsqueeze(1), hidden_state).squeeze(1)
         return pooled
 
     def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut):
-        # 0. Najdeme index mutace přímo z rozdílu tokenů
+        # 0. Find mutation index directly from token difference
         mut_indices = torch.argmax((input_ids_wt != input_ids_mut).int(), dim=1)
 
-        # 1. TRIK pro DDP: Spojíme WT a MUT do jednoho batche
+        # 1. DDP TRICK: Combine WT and MUT into a single batch
         combined_input_ids = torch.cat([input_ids_wt, input_ids_mut], dim=0)
         combined_attention_mask = torch.cat([attention_mask_wt, attention_mask_mut], dim=0)
 
-        # 2. JEDEN PRŮCHOD MODELM
+        # 2. SINGLE MODEL PASS
         out_combined = self.esm(input_ids=combined_input_ids, attention_mask=combined_attention_mask)
 
-        # 3. ROZDĚLENÍ ZPĚT NA WT A MUT
+        # 3. SPLIT BACK INTO WT AND MUT
         batch_size = input_ids_wt.size(0)
         wt_hidden_state = out_combined.last_hidden_state[:batch_size]
         mut_hidden_state = out_combined.last_hidden_state[batch_size:]
 
-        # 4. APLIKACE ATTENTION POOLINGU
+        # 4. APPLY ATTENTION POOLING
         wt_repr = self.attention_pooling(wt_hidden_state, attention_mask_wt, self.attn_query_wt)
         mut_repr = self.attention_pooling(mut_hidden_state, attention_mask_mut, self.attn_query_mut)
 
-        # 5. Výpočet rozdílu a spojení
+        # 5. Calculate difference and concatenate
         diff = mut_repr - wt_repr
         pooled_diff = self.attention_pooling(mut_hidden_state - wt_hidden_state, attention_mask_wt, self.attn_query_wt)
 
         combined_embeddings = torch.cat([wt_repr, mut_repr, diff, pooled_diff], dim=1)
-
         return self.regressor_head(combined_embeddings)
 
 
 class ComposerProteinModelESM(ComposerModel):
     def __init__(self, pretrained_model_name, tokenizer, freeze_encoder=True):
         super().__init__()
-
         self.classification_threshold = 0.0
         self.model = ESMProteinMutationCore(pretrained_model_name, tokenizer)
 
-        # --- 1. ZMRAZENÍ BACKBONE (Linear Probing) ---
+        # --- 1. FREEZE BACKBONE (Linear Probing) ---
         if freeze_encoder:
-            print(f"INFO: Zmrazuji ESM encoder (Linear Probing). Učí se pouze MLP hlava.")
+            print(f"INFO: Freezing ESM encoder (Linear Probing). Only MLP head is training.")
             for param in self.model.esm.parameters():
                 param.requires_grad = False
 
-            # Ujistíme se, že Regressor Head je odemčená
+            # Ensure Regressor Head is unfrozen
             for param in self.model.regressor_head.parameters():
                 param.requires_grad = True
         else:
-            print(f"INFO: Full Fine-Tuning (ESM encoder je odemčený).")
-            # Pokud děláme full fine-tuning, chceme gradient checkpointing pro úsporu paměti
+            print(f"INFO: Full Fine-Tuning (ESM encoder is unfrozen).")
+            # If doing full fine-tuning, enable gradient checkpointing to save memory
             self.model.esm.gradient_checkpointing_enable()
 
-        # Zmrazení pozičních embeddingů (vždy dobrý nápad u ESM)
+        # Freeze positional embeddings (always a good idea with ESM)
         for name, param in self.model.named_parameters():
             if "position_embeddings" in name:
                 param.requires_grad = False
 
-        # self.criterion = nn.HuberLoss(delta=0.2)
         self.criterion = nn.MSELoss()
 
-        # --- Metriky ---
+        # --- Metrics ---
         self.train_metrics = nn.ModuleDict({
             'mse': MeanSquaredError(),
         })
@@ -284,9 +264,8 @@ class ComposerProteinModelESM(ComposerModel):
         })
 
     def forward(self, batch):
-        # Vytáhneme jen to, co model potřebuje.
-        # ESM nepoužívá token_type_ids, a naše logika je nepotřebuje.
-        # def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut)
+        # Extract only what the model needs.
+        # ESM doesn't use token_type_ids, and our logic doesn't need them either.
         return self.model(
             input_ids_wt=batch['input_ids_wt'],
             attention_mask_wt=batch['attention_mask_wt'],
@@ -322,6 +301,170 @@ class ComposerProteinModelESM(ComposerModel):
             metric.update(binary_preds, binary_targets)
 
 
+# --- OUR NEW CUSTOM CALLBACK FOR REDUCELRONPLATEAU ---
+class ReduceLROnPlateauCallback(Callback):
+    """
+    This callback monitors the specified metric after a specific evaluation
+    (in our case 'frequent_val') and sends it to ReduceLROnPlateau.
+    """
+
+    def __init__(self, optimizer, monitor_metric='pearson', mode='max', factor=0.5, patience=1):
+        self.optimizer = optimizer
+        # Initialize standard PyTorch scheduler
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode=mode, factor=factor, patience=patience
+        )
+        self.monitor_metric = monitor_metric
+        # Save the last known LR for comparison
+        self.last_lr = [group['lr'] for group in optimizer.param_groups]
+
+    def eval_end(self, state: State, logger: Logger):
+        # Called at the end of ANY evaluation.
+        # Check if "frequent_val" just finished.
+        if state.dataloader_label == "frequent_val":
+            # Composer stores metrics in state.eval_metrics
+            metrics = state.eval_metrics.get("frequent_val", {})
+            if self.monitor_metric in metrics:
+                # Get the currently computed metric value
+                metric_val = metrics[self.monitor_metric].compute().item()
+
+                # Perform .step() with the measured value
+                self.scheduler.step(metric_val)
+
+                # Check if the optimizer LR changed and log it
+                current_lr = [group['lr'] for group in self.optimizer.param_groups]
+                if current_lr != self.last_lr:
+                    if dist.get_global_rank() == 0:
+                        print(
+                            f"\n[LR Scheduler] Metric '{self.monitor_metric}' is plateauing. Reducing Learning Rate from {self.last_lr[0]:.2e} to {current_lr[0]:.2e}!")
+                    self.last_lr = current_lr
+
+    # Important: implement state saving and loading,
+    # so the scheduler resumes correctly from a checkpoint.
+    def state_dict(self):
+        return {
+            "scheduler": self.scheduler.state_dict(),
+            "last_lr": self.last_lr
+        }
+
+    def load_state_dict(self, state):
+        self.scheduler.load_state_dict(state["scheduler"])
+        self.last_lr = state.get("last_lr", [0.0])
+
+
+# --- NEW CALLBACK FOR SAVING BEST MODEL DURING FREQ VAL ---
+class SaveBestFrequentCallback(Callback):
+    """
+    Monitors frequent_val metric and if the model improves, saves current weights
+    to a specific file for the given epoch.
+    """
+
+    def __init__(self, save_dir: str, monitor_metric: str = 'pearson', mode: str = 'max'):
+        self.save_dir = save_dir
+        self.monitor_metric = monitor_metric
+        self.mode = mode
+        # Initial worst possible value for maximization is -infinity
+        self.best_metric = float('inf') if mode == 'min' else float('-inf')
+
+    def eval_end(self, state: State, logger: Logger):
+        if state.dataloader_label == "frequent_val":
+            metrics = state.eval_metrics.get("frequent_val", {})
+            if self.monitor_metric in metrics:
+                current_metric = metrics[self.monitor_metric].compute().item()
+
+                # Check if current metric is better than the best so far
+                is_better = current_metric < self.best_metric if self.mode == 'min' else current_metric > self.best_metric
+
+                if is_better:
+                    self.best_metric = current_metric
+
+                    # Dist rank check ensures we only save from the main process (for DDP/multi-GPU)
+                    if dist.get_global_rank() == 0:
+                        os.makedirs(self.save_dir, exist_ok=True)
+                        epoch = int(state.timestamp.epoch)
+
+                        # Filename includes epoch. During one epoch, this file will be overwritten
+                        # by the best model achieved during frequent_val.
+                        filename = os.path.join(self.save_dir, f"best_frequent_epoch_{epoch}.pt")
+
+                        print(
+                            f"\n[SaveBestFrequentCallback] New record for {self.monitor_metric}: {current_metric:.4f}! Saving model to {filename}")
+
+                        # Save the model's state_dict
+                        torch.save(state.model.state_dict(), filename)
+
+    # Implementation to keep state upon resumption from checkpoint
+    def state_dict(self):
+        return {"best_metric": self.best_metric}
+
+    def load_state_dict(self, state):
+        self.best_metric = state["best_metric"]
+
+
+# --- NEW CALLBACK FOR DYNAMIC ESM MODEL UNFREEZING ---
+class UnfreezeOnPlateauCallback(Callback):
+    """
+    Monitors validation (default full_val). If the metric does not improve
+    after 'patience' steps, unfreezes the ESM model for Full Fine-Tuning.
+    """
+
+    def __init__(self, monitor_metric='pearson', mode='max', patience=1, dataloader_label='full_val'):
+        self.monitor_metric = monitor_metric
+        self.mode = mode
+        self.patience = patience
+        self.dataloader_label = dataloader_label
+        self.best_metric = float('inf') if mode == 'min' else float('-inf')
+        self.bad_epochs = 0
+        self.is_unfrozen = False
+
+    def eval_end(self, state: State, logger: Logger):
+        # If the model is already unfrozen, do nothing
+        if self.is_unfrozen:
+            return
+
+        if state.dataloader_label == self.dataloader_label:
+            metrics = state.eval_metrics.get(self.dataloader_label, {})
+            if self.monitor_metric in metrics:
+                current_metric = metrics[self.monitor_metric].compute().item()
+
+                is_better = current_metric < self.best_metric if self.mode == 'min' else current_metric > self.best_metric
+
+                if is_better:
+                    self.best_metric = current_metric
+                    self.bad_epochs = 0
+                else:
+                    self.bad_epochs += 1
+
+                if self.bad_epochs >= self.patience:
+                    if dist.get_global_rank() == 0:
+                        print(
+                            f"\n[UnfreezeCallback] No improvement for {self.patience} validations on {self.dataloader_label}. UNFREEZING ESM MODEL!")
+
+                    # Handle potential DDP wrapper (get direct access to ComposerModel)
+                    base_model = state.model.module if hasattr(state.model, 'module') else state.model
+
+                    # Unfreeze ESM layer parameters
+                    for param in base_model.model.esm.parameters():
+                        param.requires_grad = True
+
+                    # Enable gradient checkpointing (saves VRAM when training such a large model)
+                    base_model.model.esm.gradient_checkpointing_enable()
+
+                    self.is_unfrozen = True
+
+    def state_dict(self):
+        return {
+            "best_metric": self.best_metric,
+            "bad_epochs": self.bad_epochs,
+            "is_unfrozen": self.is_unfrozen
+        }
+
+    def load_state_dict(self, state):
+        self.best_metric = state["best_metric"]
+        self.bad_epochs = state["bad_epochs"]
+        self.is_unfrozen = state["is_unfrozen"]
+
+
 # --- 3. HTML Report Generator ---
 import wandb
 
@@ -336,8 +479,6 @@ def log_interactive_report_polars(df: pl.DataFrame, table_name: str, step: int =
     )
 
     json_data = df_export.write_json()
-
-    # Path to template
     template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mnt', 'html_templates',
                                  'interactive_report_template.html')
 
@@ -419,8 +560,6 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         del config_dict["wandb_token"]
     print(f"The config: {json.dumps(config_dict)}")
 
-    # 1. Tokenizer
-    # AutoTokenizer is safer for ESM than EsmTokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model)
 
     print(f"Preprocessing Training Data (Window Size: {config.seq_window_size})...")
@@ -434,12 +573,8 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
     if isinstance(validation_df, pd.DataFrame):
         validation_df = pl.from_pandas(validation_df)
 
-    # 2. Model
     composer_model = ComposerProteinModelESM(config.pretrained_model, tokenizer)
 
-    # NOTE: No freezing here. Full fine-tuning.
-
-    # 3. DataLoaders
     train_dataset = ProteinMutationDatasetESM(train_df, tokenizer, config.max_length)
     train_sampler = dist.get_sampler(train_dataset, shuffle=True, drop_last=True)
     train_dataloader = DataLoader(train_dataset,
@@ -467,13 +602,12 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
                                  pin_memory=True,
                                  num_workers=num_workers)
 
-    # 4. Evaluators
     eval_frequent = Evaluator(
         label="frequent_val",
         dataloader=val_loader_subset,
         metric_names=['mse', 'pearson'],
         subset_num_batches=20,
-        eval_interval="200ba"
+        eval_interval="100ba"
     )
 
     eval_full = Evaluator(
@@ -483,22 +617,52 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
     )
 
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
-    scheduler = CosineAnnealingWithWarmupScheduler(t_warmup="500ba", alpha_f=0.01)
 
-    # 5. Callbacks
+    # Setup ReduceLROnPlateau for Pearson correlation (looking for maximum)
+    lr_plateau_callback = ReduceLROnPlateauCallback(
+        optimizer=optimizer,
+        monitor_metric='pearson',
+        mode='max',
+        factor=0.5,
+        patience=1  # Changed from 2 to 1
+    )
+
+    # Add callback to save best model according to frequent_val (by Pearson)
+    save_path = os.path.join(config.base_dir, config.save_folder)
+    save_best_freq_callback = SaveBestFrequentCallback(
+        save_dir=save_path,
+        monitor_metric='pearson',
+        mode='max'
+    )
+
+    # Callback to unfreeze ESM model after 3 validations without improvement on frequent_val
+    unfreeze_callback = UnfreezeOnPlateauCallback(
+        monitor_metric='pearson',
+        mode='max',
+        patience=3,
+        dataloader_label='frequent_val'
+    )
+
     html_callback = InteractiveReportCallbackESM(
         log_function=log_interactive_report_polars,
         val_original_df=validation_df
     )
 
-    early_stopper = EarlyStopper(
-        monitor="mcc",
+    # ORIGINAL EARLY STOPPER (Monitors the whole epoch - full_val)
+    early_stopper_full = EarlyStopper(
+        monitor="mcc",  # Can also be changed to pearson in the future if mcc is not optimal
         dataloader_label="full_val",
         patience=config.early_stopping_patience,
         min_delta=config.early_stopping_delta
     )
 
-    save_path = os.path.join(config.base_dir, config.save_folder)
+    early_stopper_freq = EarlyStopper(
+        monitor="pearson",
+        dataloader_label="frequent_val",
+        patience=config.early_stopping_patience_freq,  # Set to 10
+        min_delta=config.early_stopping_delta
+    )
+
     checkpoint_saver = CheckpointSaver(
         folder=save_path,
         filename="model_epoch_{epoch}.pt",
@@ -506,7 +670,18 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         overwrite=False
     )
 
-    callbacks = [LRMonitor(), OptimizerMonitor(), html_callback, early_stopper, checkpoint_saver]
+    # Added the second early stopper
+    callbacks = [
+        LRMonitor(),
+        OptimizerMonitor(),
+        html_callback,
+        early_stopper_full,
+        early_stopper_freq,
+        checkpoint_saver,
+        lr_plateau_callback,
+        save_best_freq_callback,
+        unfreeze_callback
+    ]
 
     gc = GradientClipping(clipping_type='norm', clipping_threshold=1.0)
 
@@ -517,10 +692,9 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         rank_zero_only=True
     )
 
-    # 6. Trainer
-    print(f"=== Starting ESM2 Training ({epochs} epochs) ===")
+    # Update the print statement to reflect the newly set epochs
+    print(f"=== Starting ESM2 Training ({config.epochs} epochs) ===")
 
-    # Resume training if load_path is provided
     load_path = getattr(config, 'load_path', None)
     if load_path:
         print(f"Resuming training from: {load_path}")
@@ -529,17 +703,17 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         model=composer_model,
         train_dataloader=train_dataloader,
         eval_dataloader=[eval_frequent, eval_full],
-        max_duration=f"{epochs}ep",
+        max_duration=f"{config.epochs}ep",  # Now takes the parameter from config.epochs (e.g., 50)
         optimizers=optimizer,
-        schedulers=scheduler,
         algorithms=[gc],
         seed=42,
         load_path=load_path,
-        # parallelism_config={'ddp': {'find_unused_parameters': True}, },
         callbacks=callbacks,
         loggers=[wandb_logger],
         device="gpu",
         precision="amp_bf16",
+        # AUTOMATIC MICROBATCHING: This solves OOM errors when unfreezing the model!
+        device_train_microbatch_size="auto"
     )
 
     trainer.fit()
