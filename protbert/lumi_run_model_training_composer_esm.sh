@@ -47,7 +47,7 @@ export CONT_CACHE_ROOT="${MNT_DIR_CONTAINER}/cache_system_v2"
 export EPOCHS_FULL=2
 export BATCH_SIZE=48
 export BASE_DIR="/mnt/data/datasets/"
-export DATASETS_PREFIX="dataset_homology_split_"
+export DATASETS_PREFIX="dataset_homology_split_rev_fixed_"
 export PROJECT_NAME="ESM-Siamese"
 export MODEL_NAME="facebook/esm2_t33_650M_UR50D"
 export SEQ_WINDOW_SIZE=500
@@ -90,7 +90,7 @@ export SCRIPT_ARGS="--batch_size ${BATCH_SIZE} \
     --seq_window_size ${SEQ_WINDOW_SIZE} \
     --epochs ${EPOCHS_FULL} \
     --save_folder ${CHECKPOINT_SAVE_FOLDER} \
-    --lr 1e-4 "
+    --lr 5e-3 "
 
 echo "Spouštím multi-node trénink na $NNODES uzlech..."
 

@@ -170,13 +170,11 @@ class ESMProteinMutationCore(nn.Module):
 
         hidden_size = self.esm.config.hidden_size
 
-        # Attention pooling projection
-        self.attn_query_wt = nn.Parameter(torch.randn(hidden_size))
-        self.attn_query_mut = nn.Parameter(torch.randn(hidden_size))
-        self.key_proj = nn.Linear(hidden_size, hidden_size)
-
-        # MLP Head - input is 4x hidden_size (wt_pooled + mut_pooled + diff + pooled_diff)
-        input_dim = hidden_size * 4
+        # MLP Head - input is 3x hidden_size:
+        # 1. WT Mean Pooled
+        # 2. MUT Mean Pooled
+        # 3. Difference (MUT - WT)
+        input_dim = hidden_size * 3
         self.regressor_head = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.GELU(),
@@ -184,20 +182,15 @@ class ESMProteinMutationCore(nn.Module):
             nn.Linear(512, 1)
         )
 
-    def attention_pooling(self, hidden_state, attention_mask, query_param):
-        batch_size, seq_len, hidden_size = hidden_state.size()
-        keys = self.key_proj(hidden_state)
-        query = query_param.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1)
-        scores = torch.bmm(query, keys.transpose(-1, -2)).squeeze(1)
-        scores = scores.masked_fill(~attention_mask.bool(), -1e9)
-        attn_weights = F.softmax(scores, dim=-1)
-        pooled = torch.bmm(attn_weights.unsqueeze(1), hidden_state).squeeze(1)
-        return pooled
+    def mean_pooling(self, token_embeddings, attention_mask):
+        """
+        Mean Pooling - Takes attention mask into account for correct averaging
+        (Ignores padding tokens)
+        """
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
     def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut):
-        # 0. Find mutation index directly from token difference
-        mut_indices = torch.argmax((input_ids_wt != input_ids_mut).int(), dim=1)
-
         # 1. DDP TRICK: Combine WT and MUT into a single batch
         combined_input_ids = torch.cat([input_ids_wt, input_ids_mut], dim=0)
         combined_attention_mask = torch.cat([attention_mask_wt, attention_mask_mut], dim=0)
@@ -210,15 +203,17 @@ class ESMProteinMutationCore(nn.Module):
         wt_hidden_state = out_combined.last_hidden_state[:batch_size]
         mut_hidden_state = out_combined.last_hidden_state[batch_size:]
 
-        # 4. APPLY ATTENTION POOLING
-        wt_repr = self.attention_pooling(wt_hidden_state, attention_mask_wt, self.attn_query_wt)
-        mut_repr = self.attention_pooling(mut_hidden_state, attention_mask_mut, self.attn_query_mut)
+        # 4. MEAN POOLING (Ignoring padding tokens)
+        wt_pooled = self.mean_pooling(wt_hidden_state, attention_mask_wt)
+        mut_pooled = self.mean_pooling(mut_hidden_state, attention_mask_mut)
 
-        # 5. Calculate difference and concatenate
-        diff = mut_repr - wt_repr
-        pooled_diff = self.attention_pooling(mut_hidden_state - wt_hidden_state, attention_mask_wt, self.attn_query_wt)
+        # 5. Combine extracted features mathematically
+        combined_embeddings = torch.cat([
+            wt_pooled,
+            mut_pooled,
+            mut_pooled - wt_pooled  # Global difference
+        ], dim=1)
 
-        combined_embeddings = torch.cat([wt_repr, mut_repr, diff, pooled_diff], dim=1)
         return self.regressor_head(combined_embeddings)
 
 
@@ -607,7 +602,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         dataloader=val_loader_subset,
         metric_names=['mse', 'pearson'],
         subset_num_batches=20,
-        eval_interval="100ba"
+        eval_interval="200ba"
     )
 
     eval_full = Evaluator(
@@ -656,6 +651,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         min_delta=config.early_stopping_delta
     )
 
+    # NEW EARLY STOPPER (Monitors frequent_val every 200ba)
     early_stopper_freq = EarlyStopper(
         monitor="pearson",
         dataloader_label="frequent_val",
@@ -712,7 +708,6 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         loggers=[wandb_logger],
         device="gpu",
         precision="amp_bf16",
-        # AUTOMATIC MICROBATCHING: This solves OOM errors when unfreezing the model!
         device_train_microbatch_size="auto"
     )
 

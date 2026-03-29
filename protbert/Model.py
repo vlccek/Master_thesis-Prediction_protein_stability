@@ -322,7 +322,7 @@ def train_single_model(train_df, testing_df, config):
           f"({len(train_loader)} steps per epoch × {config.epochs} epochs).")
 
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, )
 
     best_val_loss = float('inf')
     global_step = 0

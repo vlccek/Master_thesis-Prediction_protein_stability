@@ -1,17 +1,17 @@
 import argparse
 import polars as pl
-from ModelComposter import Config
+from ModelComposerESM import ConfigESM, train_esm_model # Changed import
 import os
-
-from ModelComposter import train_full_model as train_model
 
 # --- Argument parser ---
 parser = argparse.ArgumentParser(description="Train ProtBERT model on protein dataset")
 
 parser.add_argument("--limit", type=int, default=0,
                     help="Number of rows to use from the dataset")
-parser.add_argument("--lr", type=float, default=1e-6,
-                    help="Learning rate")
+parser.add_argument("--lr", type=float, default=1e-4,
+                    help="Learning rate (default: 1e-4)")
+parser.add_argument("--load_path", type=str, default=None,
+                    help="Path to checkpoint to resume training from")
 parser.add_argument("--epochs", type=int, default=5,
                     help="Number of training epochs on full dataset")
 parser.add_argument("--batch_size", type=int, default=46,
@@ -22,21 +22,21 @@ parser.add_argument("--project_name", type=str, default="protein-mutation-predic
 parser.add_argument("--datasets_prefix", type=str, default="dataset_255w_")
 parser.add_argument("--base_dir", type=str, default="./", )
 parser.add_argument("--step_validation", type=int, default=1500)
-parser.add_argument("--model_name", type=str, default="Rostlab/prot_bert")
+parser.add_argument("--model_name", type=str, default="facebook/esm2_t48_15B_UR50D") # Changed default
 parser.add_argument("--seq_window_size", type=int, default=255,
                     help="Size of the sequence window centered around mutation (default: 255)")
 parser.add_argument("--freezed_layers", type=int, default=3, )
 parser.add_argument("--num_workers", type=int, default=2,
                     help="Number of data loader workers (default: 2)")
-parser.add_argument("--save_folder", type=str, default="protbert_composer_checkpoints", )
+parser.add_argument("--save_folder", type=str, default="esm_composer_checkpoints", ) # Changed default
 parser.add_argument("--stochastic_depth_drop_rate", type=float, default=0.2,
                     help="Stochastic depth drop rate")
 args = parser.parse_args()
 
 print(f"the datasets_base_dir {args.base_dir} and datasets_prefix {args.datasets_prefix}")
 
-TRAIN_PATH = os.path.join(args.base_dir, f"{args.datasets_prefix}train.csv")
-TEST_PATH = os.path.join(args.base_dir, f"{args.datasets_prefix}test.csv")
+TRAIN_PATH = f"{args.base_dir}/{args.datasets_prefix}train.csv"
+TEST_PATH = f"{args.base_dir}/{args.datasets_prefix}test.csv"
 
 # test if files exist
 if not os.path.exists(TRAIN_PATH):
@@ -54,7 +54,7 @@ if args.limit > 0:
     df_test = df_test[:int(max(2, args.limit * 0.1))]
 
 # --- Config setup ---
-config = Config()
+config = ConfigESM() # Changed class
 config.batch_size = args.batch_size
 config.wandb_token = "c72619d4978c2953476cc5cf60d9ac0fac32b809"
 config.learning_rate = args.lr
@@ -72,4 +72,4 @@ config.epochs = args.epochs
 
 print(f"Training with config just started :happy:")
 
-train_model(df, df_test, config, num_workers=args.num_workers, epochs=args.epochs)
+train_esm_model(df, df_test, config, num_workers=args.num_workers, epochs=args.epochs) # Changed function call
