@@ -4,8 +4,8 @@ import torch
 import os
 import numpy as np
 import datetime
-from scipy.stats import pearsonr
-from sklearn.metrics import mean_squared_error, f1_score, matthews_corrcoef, accuracy_score
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import mean_squared_error, f1_score, matthews_corrcoef, accuracy_score, r2_score
 
 from transformers import BertTokenizer, AutoTokenizer
 from torch.utils.data import DataLoader
@@ -22,8 +22,12 @@ from protbert.ModelComposter import (
 from protbert.ModelComposerESM import (
     prepare_data_dynamic as prepare_data_esm,
     ConfigESM,
-    ProteinMutationDataset as DatasetESM,
+    ProteinMutationDatasetESM as DatasetESM,
     ComposerProteinModelESM
+)
+
+from protbert.ModelComposerESM_meanpooling import (
+    ComposerProteinModelESM as ComposerProteinModelESMMeanPool
 )
 
 
@@ -41,7 +45,9 @@ def calculate_metrics(df: pl.DataFrame, output_dir: str, metadata: dict = None):
         print("WARNING: 'fitness' column has zero variance (likely dummy data). Statistics will not be relevant.")
 
     pearson_corr = 0.0
+    spearman_corr = 0.0
     mse = 0.0
+    r2 = 0.0
     pos_f1 = 0.0
     binary_mcc = 0.0
     ternary_mcc = 0.0
@@ -53,7 +59,9 @@ def calculate_metrics(df: pl.DataFrame, output_dir: str, metadata: dict = None):
 
         # 1. Regression Metrics
         pearson_corr, _ = pearsonr(y_true, y_pred)
+        spearman_corr, _ = spearmanr(y_true, y_pred)
         mse = mean_squared_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
 
         # 2. Binary Classification (Threshold 0.0 -> Improves vs Not Improves)
         y_true_bin = (y_true > 0).astype(int)
@@ -93,8 +101,10 @@ def calculate_metrics(df: pl.DataFrame, output_dir: str, metadata: dict = None):
     if has_ground_truth:
         stats_output = (
             f"--- INFERENCE RESULTS ---\n"
-            f"Pearson Correlation: {pearson_corr:.4f}\n"
-            f"MSE:                 {mse:.4f}\n"
+            f"Pearson Correlation:  {pearson_corr:.4f}\n"
+            f"Spearman Correlation: {spearman_corr:.4f}\n"
+            f"MSE:                  {mse:.4f}\n"
+            f"R2 Score:             {r2:.4f}\n"
             f"--------------------------\n"
             f"Binary (Thresh > 0.0)\n"
             f"  Pos F1 Score:      {pos_f1:.4f}\n"
@@ -110,11 +120,12 @@ def calculate_metrics(df: pl.DataFrame, output_dir: str, metadata: dict = None):
     full_output = header + stats_output
     print(full_output)
 
-    # Save to metrics.txt
+    # Append to metrics.txt
     metrics_path = os.path.join(output_dir, "metrics.txt")
-    with open(metrics_path, "w") as f:
+    with open(metrics_path, "a") as f:
+        f.write("\n" + "="*50 + "\n")
         f.write(full_output)
-    print(f"Statistics and metadata saved to: {metrics_path}")
+    print(f"Statistics and metadata appended to: {metrics_path}")
 
 
 def run_inference(input_file, checkpoint_path, output_file, batch_size, device, model_type):
@@ -135,6 +146,12 @@ def run_inference(input_file, checkpoint_path, output_file, batch_size, device, 
         prep_fn = prepare_data_esm
         dataset_cls = DatasetESM
         model_cls = ComposerProteinModelESM
+    elif model_type.lower() == "esm_meanpool":
+        config = ConfigESM()
+        tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model)
+        prep_fn = prepare_data_esm
+        dataset_cls = DatasetESM
+        model_cls = ComposerProteinModelESMMeanPool
     else:
         config = ConfigProtbert()
         tokenizer = BertTokenizer.from_pretrained(config.pretrained_model, do_lower_case=False)
@@ -147,6 +164,19 @@ def run_inference(input_file, checkpoint_path, output_file, batch_size, device, 
         df_raw = pl.read_parquet(input_file)
     else:
         df_raw = pl.read_csv(input_file)
+
+    # Fallbacks for PONSOL / S350 columns
+    rename_map = {}
+    if "wt_sequence" not in df_raw.columns and "sequence" in df_raw.columns:
+        rename_map["sequence"] = "wt_sequence"
+    if "mut_sequence" not in df_raw.columns and "sequence_mutated" in df_raw.columns:
+        rename_map["sequence_mutated"] = "mut_sequence"
+    if "mutation" not in df_raw.columns and "mutations" in df_raw.columns:
+        rename_map["mutations"] = "mutation"
+    
+    if rename_map:
+        print(f"INFO: Renaming columns: {rename_map}")
+        df_raw = df_raw.rename(rename_map)
 
     # Check for target column
     if "fitness" not in df_raw.columns:
@@ -179,6 +209,11 @@ def run_inference(input_file, checkpoint_path, output_file, batch_size, device, 
         state_dict = checkpoint['state_dict']
     else:
         state_dict = checkpoint
+    
+    # Strip 'module.' prefix if it exists (common when saved with DistributedDataParallel or Composer)
+    if any(k.startswith('module.') for k in state_dict.keys()):
+        print("INFO: Stripping 'module.' prefix from state_dict keys.")
+        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
         
     model.load_state_dict(state_dict)
     model.eval()
@@ -188,7 +223,7 @@ def run_inference(input_file, checkpoint_path, output_file, batch_size, device, 
     print("Predicting...")
     with torch.no_grad():
         for batch in tqdm(dataloader):
-            if model_type.lower() == "esm":
+            if model_type.lower() in ["esm", "esm_meanpool"]:
                 inputs = {
                     'input_ids_wt': batch['input_ids_wt'].to(device),
                     'attention_mask_wt': batch['attention_mask_wt'].to(device),
@@ -203,7 +238,8 @@ def run_inference(input_file, checkpoint_path, output_file, batch_size, device, 
                 }
             
             outputs = model(inputs)
-            preds = outputs.squeeze().cpu().numpy().tolist()
+            # Cast to float32 because numpy doesn't support bfloat16
+            preds = outputs.squeeze().to(torch.float32).cpu().numpy().tolist()
             if isinstance(preds, float): preds = [preds]
             predictions.extend(preds)
 
@@ -227,7 +263,7 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, required=True, help="Input dataset path (.csv or .parquet)")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
     parser.add_argument("--output", type=str, required=True, help="Output CSV path")
-    parser.add_argument("--model_type", type=str, default="protbert", choices=["protbert", "esm"], help="Model type: protbert or esm")
+    parser.add_argument("--model_type", type=str, default="protbert", choices=["protbert", "esm", "esm_meanpool"], help="Model type: protbert, esm or esm_meanpool")
     parser.add_argument("--batch_size", type=int, default=32)
 
     args = parser.parse_args()
