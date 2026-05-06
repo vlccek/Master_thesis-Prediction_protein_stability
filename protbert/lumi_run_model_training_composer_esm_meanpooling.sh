@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=esm_composer
+#SBATCH --job-name=esm_meanpool_composer
 #SBATCH --account=project_465002740
 #SBATCH --partition=standard-g
 #SBATCH --nodes=1
@@ -10,7 +10,7 @@
 
 # --- Network & Distributed Setup   ---
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-export MASTER_PORT=29500
+export MASTER_PORT=29501
 export GPUS_PER_NODE=8
 export NNODES=$SLURM_NNODES
 export WORLD_SIZE=$(($GPUS_PER_NODE * $NNODES))
@@ -25,11 +25,11 @@ export MNT_DIR_CONTAINER=/mnt/data
 
 # --- Time-based Directory Setup ---
 export START_TIME=$(date +"%Y-%m-%d_%H-%M-%S")
-export HOST_RUN_DIR="${PROJECT_DIR}/runs-esm/${START_TIME}"
+export HOST_RUN_DIR="${PROJECT_DIR}/runs-esm-meanpool/${START_TIME}"
 mkdir -p "${HOST_RUN_DIR}"
 
 # Cesta uvnitř KONTEJNERU
-export CONT_RUN_DIR="${MNT_DIR_CONTAINER}/runs-esm/esm511${START_TIME}"
+export CONT_RUN_DIR="${MNT_DIR_CONTAINER}/runs-esm-meanpool/${START_TIME}"
 
 # --- CACHE SETUP (CRITICAL FOR LUMI/AMD) ---
 export HOST_CACHE_ROOT="${PROJECT_DIR}/cache_system_v2"
@@ -48,7 +48,7 @@ export EPOCHS_FULL=2
 export BATCH_SIZE=48
 export BASE_DIR="/mnt/data/datasets/"
 export DATASETS_PREFIX="dataset_homology_split_rev_fixed_"
-export PROJECT_NAME="ESM-Siamese"
+export PROJECT_NAME="ESM-MeanPooling"
 export MODEL_NAME="facebook/esm2_t33_650M_UR50D"
 export SEQ_WINDOW_SIZE=500
 export CHECKPOINT_SAVE_FOLDER="${CONT_RUN_DIR}/checkpoints"
@@ -60,26 +60,18 @@ export WANDB_DATA_DIR="${CONT_CACHE_ROOT}/wandb_data"
 mkdir -p "${HOST_RUN_DIR}/wandb" "${HOST_CACHE_ROOT}/wandb_cache" "${HOST_CACHE_ROOT}/wandb_data"
 
 # --- LUMI Specific Hardware Settings ---
-# Upravená maska pro 1 task na uzel (pokrývá všechna jádra, Composer si to přebere)
-# Pokud by to dělalo problémy, lze masku odstranit, ale na LUMI je doporučeno vázat.
-# Zde používáme masku, která dovolí procesu vidět vše, protože Composer si thready managuje sám.
 export CPU_BIND="mask_cpu:0xffffffffffffff00"
 export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export NCCL_NET_GDR_LEVEL=PHB
-export NCCL_DEBUG=INFO # Pro debugování, pokud se to zasekne
+export NCCL_DEBUG=INFO
 
 export CONTAINER=/flash/project_465002740/containers/rocm-esm-wandb-composer-rocm7.2.sif
 
 # --- Command Construction ---
-
-# Příkaz pro spuštění uvnitř kontejneru
-# Používáme proměnné předané přes srun/bash
 export COMPOSER_ARGS="--world_size $WORLD_SIZE \
     --master_addr $MASTER_ADDR \
     --master_port $MASTER_PORT"
 
-# Optional: Set LOAD_PATH to resume training from a checkpoint
-# Example: export LOAD_PATH="/mnt/data/checkpoints/model_epoch_3.pt"
 export LOAD_PATH=""
 
 export SCRIPT_ARGS="--batch_size ${BATCH_SIZE} \
@@ -92,7 +84,7 @@ export SCRIPT_ARGS="--batch_size ${BATCH_SIZE} \
     --save_folder ${CHECKPOINT_SAVE_FOLDER} \
     --lr 5e-3 "
 
-echo "Spouštím multi-node trénink na $NNODES uzlech..."
+echo "Spouštím multi-node trénink ESM MeanPooling na $NNODES uzlech..."
 
 srun \
     --ntasks-per-node=1 \
@@ -117,4 +109,4 @@ srun \
     bash -c "export NODE_RANK=\$SLURM_PROCID && \
              echo \"Node Rank: \$NODE_RANK / World Size: $WORLD_SIZE\" && \
              composer $COMPOSER_ARGS --node_rank \$NODE_RANK \
-             ${MNT_DIR_CONTAINER}/train_composer_esm.py $SCRIPT_ARGS"
+             ${MNT_DIR_CONTAINER}/train_composer_esm_meanpooling.py $SCRIPT_ARGS"

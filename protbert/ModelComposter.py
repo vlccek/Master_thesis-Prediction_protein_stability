@@ -128,9 +128,14 @@ class ProteinMutationDataset(Dataset):
         """
         self.tokenizer = tokenizer
 
-        self.wt_seqs = processed_df["clean_wt"].to_list()
-        self.mut_seqs = processed_df["clean_mut"].to_list()
-        self.targets = processed_df["fitness"].to_list()
+        # Filter out rows with None sequences
+        valid_df = processed_df.drop_nulls(["clean_wt", "clean_mut"])
+        if len(valid_df) < len(processed_df):
+            print(f"WARNING: Dropped {len(processed_df) - len(valid_df)} rows with None sequences.")
+
+        self.wt_seqs = valid_df["clean_wt"].to_list()
+        self.mut_seqs = valid_df["clean_mut"].to_list()
+        self.targets = valid_df["fitness"].to_list()
 
         self.max_length = max_length
         self.ids = list(range(len(self.targets)))

@@ -39,8 +39,8 @@ class ConfigESM:
     epochs: int = 50
     early_stopping_patience: int = 3
     # NEW PARAMETER FOR FREQ_VAL EARLY STOPPER (must be greater than unfreeze callback patience)
-    early_stopping_patience_freq: int = 8
-    early_stopping_delta: float = 0.2
+    early_stopping_patience_freq: int = 10
+    early_stopping_delta: float = 0.001
     base_dir: str = "./"
     seq_window_size: int = 511  # ESM2 context is larger, we can use larger windows
     save_folder: str = "checkpoints_esm2"
@@ -113,15 +113,9 @@ def prepare_data_dynamic(df: pl.DataFrame, max_total_length: int = 1024, window_
 class ProteinMutationDatasetESM(Dataset):
     def __init__(self, processed_df: pl.DataFrame, tokenizer, max_length=1024):
         self.tokenizer = tokenizer
-        
-        # Filter out rows with None sequences
-        valid_df = processed_df.drop_nulls(["clean_wt", "clean_mut"])
-        if len(valid_df) < len(processed_df):
-            print(f"WARNING: Dropped {len(processed_df) - len(valid_df)} rows with None sequences.")
-            
-        self.wt_seqs = valid_df["clean_wt"].to_list()
-        self.mut_seqs = valid_df["clean_mut"].to_list()
-        self.targets = valid_df["fitness"].to_list()
+        self.wt_seqs = processed_df["clean_wt"].to_list()
+        self.mut_seqs = processed_df["clean_mut"].to_list()
+        self.targets = processed_df["fitness"].to_list()
         self.max_length = max_length
         self.ids = list(range(len(self.targets)))
 
@@ -176,35 +170,25 @@ class ESMProteinMutationCore(nn.Module):
 
         hidden_size = self.esm.config.hidden_size
 
-        # Attention pooling projection
-        self.attn_query_wt = nn.Parameter(torch.randn(hidden_size))
-        self.attn_query_mut = nn.Parameter(torch.randn(hidden_size))
-        self.key_proj = nn.Linear(hidden_size, hidden_size)
-
-        # MLP Head - input is 4x hidden_size (wt_pooled + mut_pooled + diff + pooled_diff)
-        input_dim = hidden_size * 4
+        # MLP Head - input is 3x hidden_size:
+        # 1. WT Mean Pooled
+        # 2. MUT Mean Pooled
+        # 3. Difference (MUT - WT)
+        input_dim = hidden_size * 3
         self.regressor_head = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(512, 1)
         )
-        
-        # Cast to bfloat16 for consistency with ESM
-        self.attn_query_wt = nn.Parameter(self.attn_query_wt.to(torch.bfloat16))
-        self.attn_query_mut = nn.Parameter(self.attn_query_mut.to(torch.bfloat16))
-        self.key_proj = self.key_proj.to(torch.bfloat16)
-        self.regressor_head = self.regressor_head.to(torch.bfloat16)
 
-    def attention_pooling(self, hidden_state, attention_mask, query_param):
-        batch_size, seq_len, hidden_size = hidden_state.size()
-        keys = self.key_proj(hidden_state)
-        query = query_param.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1)
-        scores = torch.bmm(query, keys.transpose(-1, -2)).squeeze(1)
-        scores = scores.masked_fill(~attention_mask.bool(), -1e9)
-        attn_weights = F.softmax(scores, dim=-1)
-        pooled = torch.bmm(attn_weights.unsqueeze(1), hidden_state).squeeze(1)
-        return pooled
+    def mean_pooling(self, token_embeddings, attention_mask):
+        """
+        Mean Pooling - Takes attention mask into account for correct averaging
+        (Ignores padding tokens)
+        """
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
     def forward(self, input_ids_wt, attention_mask_wt, input_ids_mut, attention_mask_mut):
         # 1. DDP TRICK: Combine WT and MUT into a single batch
@@ -219,15 +203,17 @@ class ESMProteinMutationCore(nn.Module):
         wt_hidden_state = out_combined.last_hidden_state[:batch_size]
         mut_hidden_state = out_combined.last_hidden_state[batch_size:]
 
-        # 4. APPLY ATTENTION POOLING
-        wt_repr = self.attention_pooling(wt_hidden_state, attention_mask_wt, self.attn_query_wt)
-        mut_repr = self.attention_pooling(mut_hidden_state, attention_mask_mut, self.attn_query_mut)
+        # 4. MEAN POOLING (Ignoring padding tokens)
+        wt_pooled = self.mean_pooling(wt_hidden_state, attention_mask_wt)
+        mut_pooled = self.mean_pooling(mut_hidden_state, attention_mask_mut)
 
-        # 5. Calculate difference and concatenate
-        diff = mut_repr - wt_repr
-        pooled_diff = self.attention_pooling(mut_hidden_state - wt_hidden_state, attention_mask_wt, self.attn_query_wt)
+        # 5. Combine extracted features mathematically
+        combined_embeddings = torch.cat([
+            wt_pooled,
+            mut_pooled,
+            mut_pooled - wt_pooled  # Global difference
+        ], dim=1)
 
-        combined_embeddings = torch.cat([wt_repr, mut_repr, diff, pooled_diff], dim=1)
         return self.regressor_head(combined_embeddings)
 
 
@@ -256,7 +242,8 @@ class ComposerProteinModelESM(ComposerModel):
             if "position_embeddings" in name:
                 param.requires_grad = False
 
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.HuberLoss(delta=0.2)
+
 
         # --- Metrics ---
         self.train_metrics = nn.ModuleDict({
@@ -315,13 +302,10 @@ class ReduceLROnPlateauCallback(Callback):
     """
     This callback monitors the specified metric after a specific evaluation
     (in our case 'frequent_val') and sends it to ReduceLROnPlateau.
-    If LR is reduced, it also reloads the best weights found so far to restart from a good state.
     """
 
-    def __init__(self, optimizer, save_best_freq_callback, monitor_metric='pearson', mode='max', factor=0.5,
-                 patience=1):
+    def __init__(self, optimizer, monitor_metric='pearson', mode='max', factor=0.5, patience=1):
         self.optimizer = optimizer
-        self.save_best_freq_callback = save_best_freq_callback
         # Initialize standard PyTorch scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode=mode, factor=factor, patience=patience
@@ -348,34 +332,7 @@ class ReduceLROnPlateauCallback(Callback):
                 if current_lr != self.last_lr:
                     if dist.get_global_rank() == 0:
                         print(
-                            f"\n[LR Scheduler] Metric '{self.monitor_metric}' is plateauing. "
-                            f"Reducing Learning Rate from {self.last_lr[0]:.2e} to {current_lr[0]:.2e}!")
-
-                    # --- RELOAD BEST WEIGHTS MECHANISM ---
-                    # We reload weights from the best model found by SaveBestFrequentCallback
-                    epoch = int(state.timestamp.epoch)
-                    best_model_path = os.path.join(self.save_best_freq_callback.save_dir,
-                                                   f"best_frequent_epoch_{epoch}.pt")
-
-                    if os.path.exists(best_model_path):
-                        if dist.get_global_rank() == 0:
-                            print(f"[LR Scheduler] Reloading best weights from: {best_model_path}")
-
-                        # Load state dict directly to the model
-                        best_state_dict = torch.load(best_model_path, map_location='cpu', weights_only=True)
-
-                        # Strip 'module.' prefix if it exists (robustness for DDP)
-                        if any(k.startswith('module.') for k in best_state_dict.keys()):
-                            best_state_dict = {k.replace('module.', '', 1): v for k, v in best_state_dict.items()}
-
-                        # Handle potential DDP wrapper for the current model
-                        base_model = state.model.module if hasattr(state.model, 'module') else state.model
-                        base_model.load_state_dict(best_state_dict)
-                    else:
-                        if dist.get_global_rank() == 0:
-                            print(
-                                f"[LR Scheduler] Warning: Best model file not found at {best_model_path}. Skipping reload.")
-
+                            f"\n[LR Scheduler] Metric '{self.monitor_metric}' is plateauing. Reducing Learning Rate from {self.last_lr[0]:.2e} to {current_lr[0]:.2e}!")
                     self.last_lr = current_lr
 
     # Important: implement state saving and loading,
@@ -429,9 +386,8 @@ class SaveBestFrequentCallback(Callback):
                         print(
                             f"\n[SaveBestFrequentCallback] New record for {self.monitor_metric}: {current_metric:.4f}! Saving model to {filename}")
 
-                        # Save the model's state_dict (unwrapped if using DDP)
-                        model_to_save = state.model.module if hasattr(state.model, 'module') else state.model
-                        torch.save(model_to_save.state_dict(), filename)
+                        # Save the model's state_dict
+                        torch.save(state.model.state_dict(), filename)
 
     # Implementation to keep state upon resumption from checkpoint
     def state_dict(self):
@@ -439,6 +395,70 @@ class SaveBestFrequentCallback(Callback):
 
     def load_state_dict(self, state):
         self.best_metric = state["best_metric"]
+
+
+# --- NEW CALLBACK FOR DYNAMIC ESM MODEL UNFREEZING ---
+class UnfreezeOnPlateauCallback(Callback):
+    """
+    Monitors validation (default full_val). If the metric does not improve
+    after 'patience' steps, unfreezes the ESM model for Full Fine-Tuning.
+    """
+
+    def __init__(self, monitor_metric='pearson', mode='max', patience=1, dataloader_label='full_val'):
+        self.monitor_metric = monitor_metric
+        self.mode = mode
+        self.patience = patience
+        self.dataloader_label = dataloader_label
+        self.best_metric = float('inf') if mode == 'min' else float('-inf')
+        self.bad_epochs = 0
+        self.is_unfrozen = False
+
+    def eval_end(self, state: State, logger: Logger):
+        # If the model is already unfrozen, do nothing
+        if self.is_unfrozen:
+            return
+
+        if state.dataloader_label == self.dataloader_label:
+            metrics = state.eval_metrics.get(self.dataloader_label, {})
+            if self.monitor_metric in metrics:
+                current_metric = metrics[self.monitor_metric].compute().item()
+
+                is_better = current_metric < self.best_metric if self.mode == 'min' else current_metric > self.best_metric
+
+                if is_better:
+                    self.best_metric = current_metric
+                    self.bad_epochs = 0
+                else:
+                    self.bad_epochs += 1
+
+                if self.bad_epochs >= self.patience:
+                    if dist.get_global_rank() == 0:
+                        print(
+                            f"\n[UnfreezeCallback] No improvement for {self.patience} validations on {self.dataloader_label}. UNFREEZING ESM MODEL!")
+
+                    # Handle potential DDP wrapper (get direct access to ComposerModel)
+                    base_model = state.model.module if hasattr(state.model, 'module') else state.model
+
+                    # Unfreeze ESM layer parameters
+                    for param in base_model.model.esm.parameters():
+                        param.requires_grad = True
+
+                    # Enable gradient checkpointing (saves VRAM when training such a large model)
+                    base_model.model.esm.gradient_checkpointing_enable()
+
+                    self.is_unfrozen = True
+
+    def state_dict(self):
+        return {
+            "best_metric": self.best_metric,
+            "bad_epochs": self.bad_epochs,
+            "is_unfrozen": self.is_unfrozen
+        }
+
+    def load_state_dict(self, state):
+        self.best_metric = state["best_metric"]
+        self.bad_epochs = state["bad_epochs"]
+        self.is_unfrozen = state["is_unfrozen"]
 
 
 # --- 3. HTML Report Generator ---
@@ -582,8 +602,8 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         label="frequent_val",
         dataloader=val_loader_subset,
         metric_names=['mse', 'pearson'],
-        subset_num_batches=10,
-        eval_interval="50ba"
+        subset_num_batches=20,
+        eval_interval="200ba"
     )
 
     eval_full = Evaluator(
@@ -594,6 +614,15 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
 
     optimizer = DecoupledAdamW(composer_model.parameters(), lr=config.learning_rate)
 
+    # Setup ReduceLROnPlateau for Pearson correlation (looking for maximum)
+    lr_plateau_callback = ReduceLROnPlateauCallback(
+        optimizer=optimizer,
+        monitor_metric='pearson',
+        mode='max',
+        factor=0.5,
+        patience=1  # Changed from 2 to 1
+    )
+
     # Add callback to save best model according to frequent_val (by Pearson)
     save_path = os.path.join(config.base_dir, config.save_folder)
     save_best_freq_callback = SaveBestFrequentCallback(
@@ -602,14 +631,12 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         mode='max'
     )
 
-    # Setup ReduceLROnPlateau for Pearson correlation (looking for maximum)
-    lr_plateau_callback = ReduceLROnPlateauCallback(
-        optimizer=optimizer,
-        save_best_freq_callback=save_best_freq_callback,
+    # Callback to unfreeze ESM model after 3 validations without improvement on frequent_val
+    unfreeze_callback = UnfreezeOnPlateauCallback(
         monitor_metric='pearson',
         mode='max',
-        factor=0.5,
-        patience=1  # Changed from 2 to 1
+        patience=3,
+        dataloader_label='frequent_val'
     )
 
     html_callback = InteractiveReportCallbackESM(
@@ -625,6 +652,7 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         min_delta=config.early_stopping_delta
     )
 
+    # NEW EARLY STOPPER (Monitors frequent_val every 200ba)
     early_stopper_freq = EarlyStopper(
         monitor="pearson",
         dataloader_label="frequent_val",
@@ -648,7 +676,8 @@ def train_esm_model(train_df_raw, val_df_raw, config: ConfigESM, num_workers=1, 
         early_stopper_freq,
         checkpoint_saver,
         lr_plateau_callback,
-        save_best_freq_callback
+        save_best_freq_callback,
+        unfreeze_callback
     ]
 
     gc = GradientClipping(clipping_type='norm', clipping_threshold=1.0)
