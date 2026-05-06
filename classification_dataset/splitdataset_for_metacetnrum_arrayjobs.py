@@ -23,8 +23,7 @@ processed_df = (
     .select(pl.col("original_seq_full"))
     .unique()
     .filter(
-        pl.col("original_seq_full").is_not_null() &
-        (pl.col("original_seq_full").str.len_chars() >= MIN_SEQ_LEN)
+        pl.col("original_seq_full").is_not_null()
     )
     .with_row_index(name="id")
     .select(

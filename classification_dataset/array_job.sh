@@ -2,14 +2,14 @@
 #PBS -N ipro_scan_v6
 #PBS -l select=1:ncpus=4:mem=16gb:scratch_local=40gb
 #PBS -l walltime=6:00:00
-#PBS -J 0-194
+#PBS -J 0-1
 
 
 # 194
 # === CESTY ===
 BASE_DIR="$PBS_O_WORKDIR"
 INPUT_DIR="$BASE_DIR/input_chunks"
-OUTPUT_DIR="$BASE_DIR/results"
+OUTPUT_DIR="$BASE_DIR/results-tests/"
 
 # Cesty k tomu, co jsme stáhli v kroku 2
 SETUP_DIR="$BASE_DIR"
