@@ -1,0 +1,3 @@
+[submodule "thesis_text"]
+	path = thesis_text
+	url = git@github.com:vlccek/diplomka-jakub.git
