@@ -3,7 +3,7 @@
 #SBATCH --account=project_465002740
 #SBATCH --partition=small-g
 #SBATCH --gpus-per-node=1
-#SBATCH --time=00:08:00
+#SBATCH --time=00:30:00
 #SBATCH --output=inference-logs/bench_%j.out
 #SBATCH --error=inference-logs/bench_%j.err
 
@@ -110,14 +110,14 @@ run_bench() {
 }
 
 # Run ProtBERT on all datasets
-#run_bench "s350" "protbert" "${PROTBERT_CHECKPOINT}"
-#run_bench "ponsol" "protbert" "${PROTBERT_CHECKPOINT}"
-#run_bench "benchstab" "protbert" "${PROTBERT_CHECKPOINT}"
+run_bench "s350" "protbert" "${PROTBERT_CHECKPOINT}"
+run_bench "ponsol" "protbert" "${PROTBERT_CHECKPOINT}"
+run_bench "benchstab" "protbert" "${PROTBERT_CHECKPOINT}"
 
 # Run ESM on all datasets
-#run_bench "s350" "esm" "${ESM_CHECKPOINT}"
-#run_bench "ponsol" "esm" "${ESM_CHECKPOINT}"
-#run_bench "benchstab" "esm" "${ESM_CHECKPOINT}"
+run_bench "s350" "esm" "${ESM_CHECKPOINT}"
+run_bench "ponsol" "esm" "${ESM_CHECKPOINT}"
+run_bench "benchstab" "esm" "${ESM_CHECKPOINT}"
 
 # Run ESM MeanPooling on all datasets
 run_bench "s350" "esm_meanpool" "${ESM_MEANPOOL_CHECKPOINT}"
