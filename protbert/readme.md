@@ -1,52 +1,50 @@
-- emb.py generation of embeddings
-- data_playground.ipynb playground for data exploration, converting them to pkl file.
+# ProtBert & ESM Model Training - Master thesis
 
+This directory contains the core logic for training and evaluating protein stability prediction models (ProtBert, ESM-2)
+using the Composer framework. The work is part of the master's thesis by Jakub Vlk, carried out in the 2025/26
+academic year.
 
-#  255W training
+## Core Components
 
-```
-rsync ~/projekty/dp/protbert/ xvlkja07@nympha.meta.zcu.cz:~/dp/protbert/ -rPz  --exclude-from=rsyncignore.txt `
-```
+### Model definitions
 
-- data perations are in dataset_prepare_255w.ipynb
-- copy the `dataset_255w_*` to the metacetrum servers
-- prepare the enviroment to the env `env.tar.gz` and the `train_dataset.tar.gz` with dataset and python files (`*.py`)
-  - by `tar --use-compress-program="pigz -k " -cf training.tar.gz *.py dataset_255w_*.csv`
-  - and by `tar --use-compress-program="pigz -k " -cf env.tar.gz env` NOTE: takes a while
-- run `qsub run_model_training.sh` dont forget to set parametrs in the `run_model_training.sh` file
+- **Model.py**: Base implementation of the ProtBert model.
+- **ModelComposerESM.py**: ESM-2 integration with Composer.
+- **ModelComposerESM_meanpooling.py**: ESM-2 with mean-pooling architecture.
 
-# Running singularity container
+### Running training on LUMI
 
-- prepare the singularity image `singularity build --fakeroot protbert.sif Singularity`
-- run the singularity container `singularity shell --bind /path/to/bind:/path
+- **lumi_run_model_trainin\*.sh**: Batch job scripts for training different models.
 
-# copy to lumi scratch
+### Training scripts
 
-```bash
-rsync ~/dp/protbert/ /scratch/project_465002373/protbert/ -rPz
-```
+- **train_composer.py**: Main entry point for ProtBert training.
+- **train_composer_esm.py**: Training script for ESM-2 models.
+- **train_composer_esm_meanpooling.py**: Training script for ESM-2 with mean pooling.
 
+### Execution scripts (HPC)
 
-# Workflow for dataset preparation
+- **lumi_run_model_training_composer.sh**: Job script for LUMI (ProtBert).
+- **lumi_run_model_training_composer_esm.sh**: Job script for LUMI (ESM).
+- **run_model_training.sh**: Legacy/generic training script for MetaCentrum.
 
-**Detailed documentation:** See [DATASET_WORKFLOW.md](DATASET_WORKFLOW.md) for comprehensive information about:
-- Data sources and normalization procedures
-- Piecewise sigmoid normalization parameters (separate for positive/negative values)
-- Complete workflow for both Lehner and Megascale datasets
-- File descriptions and statistics
+## Dataset preparation workflow
 
-## Overview
+Detailed documentation on data processing can be found in [DATASET_WORKFLOW.md](DATASET_WORKFLOW.md).
 
-1) **Lehner dataset:** `lehner_dataset_preparation.ipynb`
-2) **Megascale dataset:** `megascale_dataset_preparation.ipynb` + `megascale_dataset_normalization.ipynb`
-3) **Merging datasets:** `merging_datasets.ipynb` (also adds CATH homology annotations)
-4) **255W preparation:** `dataset_prepare_255w.ipynb` (creates train/validation/test splits)
+1. **Lehner dataset:** `lehner_dataset_preparation.ipynb`
+2. **Megascale dataset:** `megascale_dataset_preparation.ipynb` & `megascale_dataset_normalization.ipynb`
+3. **Merging & CATH annotation:** `merging_datasets.ipynb`
+4. **Final split generation:** `dataset_prepare_*.ipynb` (creates train/val/test splits used for training)
 
-## Normalization
+## Environment setup
 
-Both datasets use **piecewise sigmoid normalization** with separate parameters for positive and negative values:
+### Containerized execution
 
-- **Lehner:** `k_neg = 0.871`, `k_pos = 0.871`
-- **Megascale:** `k_neg = 0.230`, `k_pos = 0.576`
+Use the Singularity definition files in the `singularity_conf/` directory to build containers for the LUMI environment (
+AMD GPUs: MI250).
 
-See `DATASET_WORKFLOW.md` for formulas and detailed explanation.
+## Authorship
+
+Files marked with the authorship of the thesis author (Jakub Vlk) belong to him. If a file does not include an
+authorship comment, please refer to the nearest README.md for the authorship information.
