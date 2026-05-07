@@ -3,6 +3,7 @@
 This repository contains tools and datasets for protein stability prediction and analysis, focusing on DDG mutation effects using models like ProtBert and ESM-2. This project is a core component of a Master's Thesis.
 
 **Thesis Text & LaTeX:** [thesis_text/](./thesis_text) (Git Submodule)
+**Excel@FIT Poster:** [posters/](./posters) (Exhibited at [Excel@FIT](https://excel.fit.vutbr.cz/))
 
 ## Repository Map
 
@@ -22,6 +23,7 @@ This repository contains tools and datasets for protein stability prediction and
 
 ### Analysis & Visualization
 - **`fig-generation/`**: Notebooks for generating figures, heatmaps, and CATH hierarchy visualizations for thesis text.
+- **`posters/`**: Conference poster from Excel@FIT.
 - **`html_templates/`**: Templates for generating interactive reports.
 
 ## Getting Started
