@@ -1,3 +1,10 @@
+# Brno universioty of technology: VUT FIT / BUT FIT
+# Master thesis
+# Predikce vlivu mutací na stabilitu proteinů / Prediction of the Effect of Mutations on Protein Stability
+# 
+# author: Jakub Vlk
+# date: 2025-12-12
+
 import polars as pl
 import os
 from tqdm.notebook import tqdm

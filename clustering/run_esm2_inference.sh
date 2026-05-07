@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Brno universioty of technology: VUT FIT / BUT FIT
+# Master thesis
+# Predikce vlivu mutací na stabilitu proteinů / Prediction of the Effect of Mutations on Protein Stability
+# 
+# author: Jakub Vlk
+# date: 2026-03-03
+
 #SBATCH --job-name=esm_composer_multinode
 #SBATCH --account=project_465002740
 #SBATCH --partition=small-g

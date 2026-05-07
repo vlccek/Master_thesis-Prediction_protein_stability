@@ -1,3 +1,10 @@
+# Brno universioty of technology: VUT FIT / BUT FIT
+# Master thesis
+# Predikce vlivu mutací na stabilitu proteinů / Prediction of the Effect of Mutations on Protein Stability
+# 
+# author: Jakub Vlk
+# date: 2025-09-21
+
 import torch
 import torch.nn as nn
 from transformers import BertModel, BertTokenizer

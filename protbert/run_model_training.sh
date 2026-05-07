@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Brno universioty of technology: VUT FIT / BUT FIT
+# Master thesis
+# Predikce vlivu mutací na stabilitu proteinů / Prediction of the Effect of Mutations on Protein Stability
+# 
+# author: Jakub Vlk
+# date: 2025-09-21
+
 #PBS -q default@pbs-m1.metacentrum.cz
 #PBS -l walltime=120:00:00
 #PBS -l select=1:ncpus=4:ngpus=1:mem=44gb:gpu_mem=60gb:scratch_ssd=40gb

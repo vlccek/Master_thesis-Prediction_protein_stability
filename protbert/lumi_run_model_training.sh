@@ -1,4 +1,12 @@
 #!/bin/bash -l
+
+# Brno universioty of technology: VUT FIT / BUT FIT
+# Master thesis
+# Predikce vlivu mutací na stabilitu proteinů / Prediction of the Effect of Mutations on Protein Stability
+# 
+# author: Jakub Vlk
+# date: 2025-12-14
+
 #SBATCH --job-name=examplejob   # Job name
 #SBATCH --output=/scratch/project_465002373/protbert/output.txt  # Name of stdout output file
 #SBATCH --error=/scratch/project_465002373/protbert/error.txt # Name of stderr error file
