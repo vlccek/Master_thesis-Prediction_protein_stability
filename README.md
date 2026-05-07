@@ -29,7 +29,7 @@ This repository contains tools and datasets for protein stability prediction and
 ## Getting Started
 Execution environments are managed via Singularity/Apptainer ment to be used on LUMI supercomputer. Note that `.sif` files are not tracked in the repository; they must be built using the definition files provided in `singularity_conf/`.
 
-### Primary Model Checkpoints
+### Primary Model Checkpoints (unavailable at github)
 The following checkpoints are used in the benchmark scripts (`benchmarks/run_all_benchmarks.sh`):
 - **ProtBERT:** `protbert/runs/2026-03-28_22-36-45/checkpoints/model_epoch_3.pt`
 - **ESM:** `protbert/runs-esm/esm5112026-03-31_02-14-07/checkpoints/best_frequent_epoch_1.pt`
